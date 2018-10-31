@@ -19,7 +19,8 @@ You can build the software yourself by configuring Maven and issuing `mvn packag
 ## Configuration
 
 ----
+
 Apache 2.0 Software License
 
-see LICENSE for details
+see [LICENSE](LICENSE) for details
 
