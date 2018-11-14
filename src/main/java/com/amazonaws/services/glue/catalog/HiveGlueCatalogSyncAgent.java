@@ -95,11 +95,13 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		private boolean run = true;
 		private CloudWatchLogsReporter cwlr;
 		private final Pattern PATTERN = Pattern.compile("(?i)CREATE EXTERNAL TABLE (.*).");
+		private ObjectQueue<String> queue;
 
-		public AthenaQueueProcessor(Configuration config) {
+		public AthenaQueueProcessor(Configuration config, ObjectQueue<String> queue) {
 			super();
 
 			this.cwlr = new CloudWatchLogsReporter(config);
+			this.queue = queue;
 		}
 
 		/**
@@ -116,9 +118,10 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		}
 
 		public void run() {
-			// run forever or until stop is called
-			while (this.run) {
-				Iterator<String> iterator = ddlQueue.iterator();
+			// run forever or until stop is called, and continue running until the queue is
+			// empty when stop is called
+			while (this.run || !(this.run && this.queue.isEmpty())) {
+				Iterator<String> iterator = this.queue.iterator();
 				if (!ddlQueue.isEmpty()) {
 					while (iterator.hasNext()) {
 						String query = iterator.next();
@@ -237,13 +240,13 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		dropTableIfExists = config.getBoolean("glue.catalog.dropTableIfExists", false);
 
 		// start the queue processor thread
-		AthenaQueueProcessor athenaQueueProcessor = new AthenaQueueProcessor(this.config);
+		AthenaQueueProcessor athenaQueueProcessor = new AthenaQueueProcessor(this.config, this.ddlQueue);
 		Thread queueProcessor = new Thread(athenaQueueProcessor);
 		queueProcessor.start();
 
 		// add a shutdown hook to close the connections
-		Runtime.getRuntime().addShutdownHook(
-				new Thread(new SyncAgentShutdownRoutine(athenaQueueProcessor), "Shutdown-thread"));
+		Runtime.getRuntime()
+				.addShutdownHook(new Thread(new SyncAgentShutdownRoutine(athenaQueueProcessor), "Shutdown-thread"));
 
 		LOG.info(String.format("%s online, connected to %s", this.getClass().getCanonicalName(), this.athenaURL));
 	}
