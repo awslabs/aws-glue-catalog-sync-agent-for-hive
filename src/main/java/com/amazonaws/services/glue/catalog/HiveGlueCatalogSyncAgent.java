@@ -33,6 +33,12 @@ import static org.apache.hadoop.hive.ql.exec.DDLTask.appendSerdeParams;
 
 public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
     private static final Logger LOG = LoggerFactory.getLogger(HiveGlueCatalogSyncAgent.class);
+    public static final String GLUE_CATALOG_DROP_TABLE_IF_EXISTS = "glue.catalog.dropTableIfExists";
+    public static final String GLUE_CATALOG_CREATE_MISSING_DB = "glue.catalog.createMissingDB";
+    public static final String GLUE_CATALOG_USER_KEY = "glue.catalog.user.key";
+    public static final String GLUE_CATALOG_USER_SECRET = "glue.catalog.user.secret";
+    public static final String GLUE_CATALOG_S3_STAGING_DIR = "glue.catalog.s3.staging.dir";
+
     private Configuration config = null;
     private Properties info;
     private String athenaURL;
@@ -170,7 +176,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
                 } else {
                     // put the thread to sleep for a configured duration
                     try {
-                        LOG.info    (String.format("DDL Queue is empty. Sleeping for %s, queue state is %s", noEventSleepDuration, ddlQueue.size()));
+                        LOG.debug(String.format("DDL Queue is empty. Sleeping for %s, queue state is %s", noEventSleepDuration, ddlQueue.size()));
                         Thread.sleep(noEventSleepDuration);
                     } catch (InterruptedException e) {
                         LOG.error(e.getMessage());
@@ -201,13 +207,13 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
         }
 
         this.info = new Properties();
-        this.info.put("s3_staging_dir", config.get("athena.s3.staging.dir"));
+        this.info.put("s3_staging_dir", config.get(GLUE_CATALOG_S3_STAGING_DIR));
         this.info.put("log_path", "/tmp/jdbc.log");
         this.info.put("log_level", "ERROR");
 
-        if (config.get("athena.athena.user.key") != null) {
-            info.put("user", config.get("athena.user.key"));
-            info.put("password", config.get("athena.user.secret"));
+        if (config.get(GLUE_CATALOG_USER_KEY) != null) {
+            info.put("user", config.get(GLUE_CATALOG_USER_KEY));
+            info.put("password", config.get(GLUE_CATALOG_USER_SECRET));
         } else {
             this.info.put("aws_credentials_provider_class",
                     com.amazonaws.auth.InstanceProfileCredentialsProvider.class.getName());
@@ -217,12 +223,12 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 
         configureAthenaConnection();
 
-        dropTableIfExists = config.getBoolean("glue.catalog.dropTableIfExists", false);
-        createMissingDB = config.getBoolean("glue.catalog.createMissingDB", true);
+        dropTableIfExists = config.getBoolean(GLUE_CATALOG_DROP_TABLE_IF_EXISTS, false);
+        createMissingDB = config.getBoolean(GLUE_CATALOG_CREATE_MISSING_DB, true);
 
         // start the queue processor thread
         AthenaQueueProcessor athenaQueueProcessor = new AthenaQueueProcessor(this.config);
-        queueProcessor = new Thread(athenaQueueProcessor, "DanielThread");
+        queueProcessor = new Thread(athenaQueueProcessor, "GlueSyncThread");
         queueProcessor.start();
 
         // add a shutdown hook to close the connections
@@ -480,7 +486,6 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
         org.apache.hadoop.hive.metastore.api.Table table = tableEvent.getTable();
         String ddl = "";
 
-        LOG.info("@@@@@@@@ Thread is " + queueProcessor.getState());
         if (table.getTableType().equals(EXTERNAL_TABLE_TYPE) && table.getSd().getLocation().startsWith("s3")) {
             try {
                 ddl = showCreateTable(tableEvent.getTable());
