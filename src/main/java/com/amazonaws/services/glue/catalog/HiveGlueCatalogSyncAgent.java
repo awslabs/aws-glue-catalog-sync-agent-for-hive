@@ -116,6 +116,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
                         while (!completed) {
                             try {
                                 Statement athenaStmt = athenaConnection.createStatement();
+                                cwlr.sendToCWL("Trying to execute: " + query);
                                 athenaStmt.execute(query);
                                 athenaStmt.close();
                                 completed = true;
