@@ -33,11 +33,12 @@ import static org.apache.hadoop.hive.ql.exec.DDLTask.appendSerdeParams;
 
 public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
     private static final Logger LOG = LoggerFactory.getLogger(HiveGlueCatalogSyncAgent.class);
-    public static final String GLUE_CATALOG_DROP_TABLE_IF_EXISTS = "glue.catalog.dropTableIfExists";
-    public static final String GLUE_CATALOG_CREATE_MISSING_DB = "glue.catalog.createMissingDB";
-    public static final String GLUE_CATALOG_USER_KEY = "glue.catalog.user.key";
-    public static final String GLUE_CATALOG_USER_SECRET = "glue.catalog.user.secret";
-    public static final String GLUE_CATALOG_S3_STAGING_DIR = "glue.catalog.s3.staging.dir";
+    private static final String GLUE_CATALOG_DROP_TABLE_IF_EXISTS = "glue.catalog.dropTableIfExists";
+    private static final String GLUE_CATALOG_CREATE_MISSING_DB = "glue.catalog.createMissingDB";
+    private static final String GLUE_CATALOG_USER_KEY = "glue.catalog.user.key";
+    private final String ATHENA_JDBC_URL = "glue.catalog.athena.jdbc.url";
+    private static final String GLUE_CATALOG_USER_SECRET = "glue.catalog.user.secret";
+    private static final String GLUE_CATALOG_S3_STAGING_DIR = "glue.catalog.athena.s3.staging.dir";
 
     private Configuration config = null;
     private Properties info;
@@ -46,7 +47,6 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
     private Connection athenaConnection;
     private volatile ConcurrentLinkedQueue<String> ddlQueue;
     private final String EXTERNAL_TABLE_TYPE = "EXTERNAL_TABLE";
-    private final String ATHENA_JDBC_URL = "athena.jdbc.url";
     private boolean dropTableIfExists = false;
     private boolean createMissingDB = true;
     private int noEventSleepDuration;
