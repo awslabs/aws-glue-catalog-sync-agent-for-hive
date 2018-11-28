@@ -191,7 +191,6 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
     public HiveGlueCatalogSyncAgent(final Configuration conf) throws Exception {
         super(conf);
         this.config = conf;
-        this.athenaURL = conf.get(ATHENA_JDBC_URL);
 
         String noopSleepDuration = this.config.get("no-event-sleep-duration");
         if (noopSleepDuration == null) {
@@ -208,9 +207,13 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
         }
 
         this.info = new Properties();
-        this.info.put("s3_staging_dir", config.get(GLUE_CATALOG_S3_STAGING_DIR));
         this.info.put("log_path", "/tmp/jdbc.log");
         this.info.put("log_level", "ERROR");
+        this.info.put("s3_staging_dir", config.get(GLUE_CATALOG_S3_STAGING_DIR));
+
+        dropTableIfExists = config.getBoolean(GLUE_CATALOG_DROP_TABLE_IF_EXISTS, false);
+        createMissingDB = config.getBoolean(GLUE_CATALOG_CREATE_MISSING_DB, true);
+        this.athenaURL = conf.get(ATHENA_JDBC_URL, "jdbc:awsathena://athena.us-east-1.amazonaws.com:443)");
 
         if (config.get(GLUE_CATALOG_USER_KEY) != null) {
             info.put("user", config.get(GLUE_CATALOG_USER_KEY));
@@ -224,8 +227,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 
         configureAthenaConnection();
 
-        dropTableIfExists = config.getBoolean(GLUE_CATALOG_DROP_TABLE_IF_EXISTS, false);
-        createMissingDB = config.getBoolean(GLUE_CATALOG_CREATE_MISSING_DB, true);
+
 
         // start the queue processor thread
         AthenaQueueProcessor athenaQueueProcessor = new AthenaQueueProcessor(this.config);
