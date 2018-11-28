@@ -1,6 +1,6 @@
 package com.amazonaws.services.glue.catalog;
 
-import com.amazonaws.athena.jdbc.shaded.org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.metastore.MetaStoreEventListener;
