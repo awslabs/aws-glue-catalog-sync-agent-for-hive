@@ -33,7 +33,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	private final String ATHENA_JDBC_URL = "glue.catalog.athena.jdbc.url";
 	private static final String GLUE_CATALOG_USER_SECRET = "glue.catalog.user.secret";
 	private static final String GLUE_CATALOG_S3_STAGING_DIR = "glue.catalog.athena.s3.staging.dir";
-	private static final String SUPPRESS_ALL_DROP_EVENTS = "glue.catalog.athena.suppressDrop";
+	private static final String SUPPRESS_ALL_DROP_EVENTS = "glue.catalog.athena.suppressAllDropEvents";
 	private static final String DEFAULT_ATHENA_CONNECTION_URL = "jdbc:awsathena://athena.us-east-1.amazonaws.com:443";
 
 	private Configuration config = null;
