@@ -63,7 +63,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 
 		public void run() {
 			// stop the queue processing thread
-			// p.stop();
+			p.stop();
 		}
 	}
 
@@ -87,15 +87,15 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		/**
 		 * Method to send a shutdown message to the queue processor
 		 */
-		// public void stop() {
-		// LOG.info(String.format("Stopping %s", this.getClass().getCanonicalName()));
-		// try {
-		// athenaConnection.close();
-		// } catch (SQLException e) {
-		// LOG.error(e.getMessage());
-		// }
-		// this.run = false;
-		// }
+		public void stop() {
+			LOG.info(String.format("Stopping %s", this.getClass().getCanonicalName()));
+			try {
+				athenaConnection.close();
+			} catch (SQLException e) {
+				LOG.error(e.getMessage());
+			}
+			this.run = false;
+		}
 
 		public void run() {
 			// run forever or until stop is called, and continue running until the queue is
@@ -228,9 +228,8 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		queueProcessor.start();
 
 		// add a shutdown hook to close the connections
-		// Runtime.getRuntime()
-		// .addShutdownHook(new Thread(new
-		// SyncAgentShutdownRoutine(athenaQueueProcessor), "Shutdown-thread"));
+		Runtime.getRuntime()
+				.addShutdownHook(new Thread(new SyncAgentShutdownRoutine(athenaQueueProcessor), "Shutdown-thread"));
 
 		LOG.info(String.format("%s online, connected to %s", this.getClass().getCanonicalName(), this.athenaURL));
 	}
