@@ -33,6 +33,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	private final String ATHENA_JDBC_URL = "glue.catalog.athena.jdbc.url";
 	private static final String GLUE_CATALOG_USER_SECRET = "glue.catalog.user.secret";
 	private static final String GLUE_CATALOG_S3_STAGING_DIR = "glue.catalog.athena.s3.staging.dir";
+	private static final String SUPPRESS_ALL_DROP_EVENTS = "glue.catalog.athena.suppressDrop";
 	private static final String DEFAULT_ATHENA_CONNECTION_URL = "jdbc:awsathena://athena.us-east-1.amazonaws.com:443";
 
 	private Configuration config = null;
@@ -46,6 +47,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	private boolean createMissingDB = true;
 	private int noEventSleepDuration;
 	private int reconnectSleepDuration;
+	private boolean suppressAllDropEvents = false;
 
 	/**
 	 * Private class to cleanup the sync agent - to be used in a Runtime shutdown
@@ -208,6 +210,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 
 		dropTableIfExists = config.getBoolean(GLUE_CATALOG_DROP_TABLE_IF_EXISTS, false);
 		createMissingDB = config.getBoolean(GLUE_CATALOG_CREATE_MISSING_DB, true);
+		suppressAllDropEvents = config.getBoolean(SUPPRESS_ALL_DROP_EVENTS, false);
 		this.athenaURL = conf.get(ATHENA_JDBC_URL, DEFAULT_ATHENA_CONNECTION_URL);
 
 		if (config.get(GLUE_CATALOG_USER_KEY) != null) {
@@ -284,17 +287,22 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	public void onDropTable(DropTableEvent tableEvent) throws MetaException {
 		super.onDropTable(tableEvent);
 
-		Table table = tableEvent.getTable();
-		String ddl = "";
+		if (!suppressAllDropEvents) {
 
-		if (table.getTableType().equals(EXTERNAL_TABLE_TYPE) && table.getSd().getLocation().startsWith("s3")) {
-			ddl = String.format("drop table if exists %s", getFqtn(table));
+			Table table = tableEvent.getTable();
+			String ddl = "";
 
-			if (!addToAthenaQueue(ddl)) {
-				LOG.error("Failed to add the DropTable event to the processing queue");
-			} else {
-				LOG.debug(String.format("Requested Drop of table: %s", table.getTableName()));
+			if (table.getTableType().equals(EXTERNAL_TABLE_TYPE) && table.getSd().getLocation().startsWith("s3")) {
+				ddl = String.format("drop table if exists %s", getFqtn(table));
+
+				if (!addToAthenaQueue(ddl)) {
+					LOG.error("Failed to add the DropTable event to the processing queue");
+				} else {
+					LOG.debug(String.format("Requested Drop of table: %s", table.getTableName()));
+				}
 			}
+		} else {
+			LOG.debug(String.format("Ignoring DropTable event as %s set to True", SUPPRESS_ALL_DROP_EVENTS));
 		}
 	}
 
@@ -366,39 +374,43 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	 */
 	public void onDropPartition(DropPartitionEvent partitionEvent) throws MetaException {
 		super.onDropPartition(partitionEvent);
+		if (!suppressAllDropEvents) {
+			if (partitionEvent.getStatus()) {
+				Table table = partitionEvent.getTable();
 
-		if (partitionEvent.getStatus()) {
-			Table table = partitionEvent.getTable();
+				if (table.getTableType().equals(EXTERNAL_TABLE_TYPE) && table.getSd().getLocation().startsWith("s3")) {
+					String fqtn = getFqtn(table);
 
-			if (table.getTableType().equals(EXTERNAL_TABLE_TYPE) && table.getSd().getLocation().startsWith("s3")) {
-				String fqtn = getFqtn(table);
+					if (fqtn != null && !fqtn.equals("")) {
+						partitionEvent.getPartitionIterator().forEachRemaining(p -> {
+							String partitionSpec = getPartitionSpec(table, p);
 
-				if (fqtn != null && !fqtn.equals("")) {
-					partitionEvent.getPartitionIterator().forEachRemaining(p -> {
-						String partitionSpec = getPartitionSpec(table, p);
+							if (p.getSd().getLocation().startsWith("s3")) {
+								String ddl = String.format("alter table %s drop if exists partition(%s);", fqtn,
+										partitionSpec);
 
-						if (p.getSd().getLocation().startsWith("s3")) {
-							String ddl = String.format("alter table %s drop if exists partition(%s);", fqtn,
-									partitionSpec);
-
-							if (!addToAthenaQueue(ddl)) {
-								LOG.error(String.format(
-										"Failed to add the DropPartition event to the processing queue for specification %s",
-										partitionSpec));
+								if (!addToAthenaQueue(ddl)) {
+									LOG.error(String.format(
+											"Failed to add the DropPartition event to the processing queue for specification %s",
+											partitionSpec));
+								} else {
+									LOG.debug(String.format("Requested Drop of Partition with Specification (%s)",
+											partitionSpec));
+								}
 							} else {
-								LOG.debug(String.format("Requested Drop of Partition with Specification (%s)",
-										partitionSpec));
+								LOG.debug(
+										String.format("Not dropping partition (%s) as it is not S3 based (location %s)",
+												partitionSpec, p.getSd().getLocation()));
 							}
-						} else {
-							LOG.debug(String.format("Not dropping partition (%s) as it is not S3 based (location %s)",
-									partitionSpec, p.getSd().getLocation()));
-						}
-					});
+						});
+					}
+				} else {
+					LOG.debug(String.format("Ignoring Drop Partition Event for Table %s as it is not stored on S3",
+							table.getTableName()));
 				}
-			} else {
-				LOG.debug(String.format("Ignoring Drop Partition Event for Table %s as it is not stored on S3",
-						table.getTableName()));
 			}
+		} else {
+			LOG.debug(String.format("Ignoring DropPartition event as %s set to True", SUPPRESS_ALL_DROP_EVENTS));
 		}
 	}
 }

@@ -123,6 +123,7 @@ Add the following keys to hive-site-xml:
 - `glue.catalog.user.secret` - If not using an instance attached IAM role, the IAM access secret.
 - `glue.catalog.dropTableIfExists` - Should an already existing table be dropped and created (default: true)
 - `glue.catalog.createMissingDB` - Should DBs be created if they don't exist (default:true)
+- `glue.catalog.athena.suppressAllDropEvents` - prevents propagation of DropTable and DropPartition events to the remote environment
 
 
 Add the Glue Sync Agent's jar to HMS' classpath and restart.
