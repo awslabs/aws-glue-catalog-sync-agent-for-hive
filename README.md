@@ -6,7 +6,7 @@ This project provides a jar that implements the [MetastoreEventListener](https:/
 
 ![architecture](architecture.png)
 
-Within the [HiveGlueCatalogSyncAgent](src/main/java/com/amazonaws/services/glue/catalog/HiveGlueCatalogSyncAgent.java), the DDL from metastore events is captured and written to a [Tape2](https://github.com/square/tape) queue, which is a disk backed queue that survives application restarts. 
+Within the [HiveGlueCatalogSyncAgent](src/main/java/com/amazonaws/services/glue/catalog/HiveGlueCatalogSyncAgent.java), the DDL from metastore events is captured and written to a ConcurrentLinkedQueue. 
 
 ![internals](internals.png)
 
@@ -25,7 +25,18 @@ Today the Catalog Sync Agent supports the following MetaStore events:
 
 ## Installation
 
-You can build the software yourself by configuring Maven and issuing `mvn package`, which will result in the binary being built to `aws-glue-catalog-sync-agent/target/HiveGlueCatalogSyncAgent-1.0-SNAPSHOT.jar`, or alternatively you can download the jar from [s3://awslabs-code-us-east-1/HiveGlueCatalogSyncAgent/HiveGlueCatalogSyncAgent-1.0-SNAPSHOT.jar](https://s3.amazonaws.com/awslabs-code-us-east-1/HiveGlueCatalogSyncAgent/HiveGlueCatalogSyncAgent-1.0-SNAPSHOT.jar) (`c11eb6f2412af66afca3aea55cbfe19f`).
+You can build the software yourself by configuring Maven and issuing `mvn package`, which will result in the binary being built to `aws-glue-catalog-sync-agent/target/HiveGlueCatalogSyncAgent-1.1-SNAPSHOT.jar`, or alternatively you can download the jar from [s3://awslabs-code-us-east-1/HiveGlueCatalogSyncAgent/HiveGlueCatalogSyncAgent-1.1-SNAPSHOT.jar](https://s3.amazonaws.com/awslabs-code-us-east-1/HiveGlueCatalogSyncAgent/HiveGlueCatalogSyncAgent-1.1-SNAPSHOT.jar) (`808ace2165025c9da7288d0caa3e6b91`). You can also run `mvn assembly:assembly`, which generates a mega jar including dependencies `aws-glue-catalog-sync-agent/target/HiveGlueCatalogSyncAgent-1.1-SNAPSHOT-jar-with-dependencies.jar` also found [here](https://s3.amazonaws.com/awslabs-code-us-east-1/HiveGlueCatalogSyncAgent/HiveGlueCatalogSyncAgent-1.1-SNAPSHOT-jar-with-dependencies.jar) (`ff54e3993d7add705840661c7ab048c2`).
+
+## Required Dependencies
+
+If you install the `HiveGlueCatalogSyncAgent-1.1-SNAPSHOT.jar` into your cluster, you must also ensure you have the following dependencies available:
+
+* Log4J
+* SLF4J
+* AWS Java SDK Core
+* org.antlr.stringtemplate
+* com.amazonaws.athena.jdbc.atl-athena-jdbc-driver, version 1.0.2-atlassian-1 or higher
+* AWS Java SDK CloudWatch Logs
 
 ## Configuration Instructions
 # S3 
