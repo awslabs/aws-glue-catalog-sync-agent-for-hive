@@ -2,6 +2,7 @@ package com.amazonaws.services.glue.catalog;
 
 import static org.apache.hadoop.hive.metastore.api.hive_metastoreConstants.META_TABLE_STORAGE;
 import static org.apache.hadoop.hive.ql.exec.DDLTask.appendSerdeParams;
+import static org.apache.hadoop.hive.serde.serdeConstants.SERIALIZATION_FORMAT;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -18,8 +19,8 @@ import org.apache.hadoop.hive.metastore.api.Order;
 import org.apache.hadoop.hive.metastore.api.SerDeInfo;
 import org.apache.hadoop.hive.metastore.api.SkewedInfo;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
-import org.apache.hadoop.hive.ql.metadata.Hive;
 import org.apache.hadoop.hive.ql.metadata.HiveException;
+import org.apache.hadoop.hive.ql.metadata.Table;
 import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer;
 import org.apache.hadoop.hive.serde.serdeConstants;
 import org.apache.hive.common.util.HiveStringUtils;
@@ -72,9 +73,38 @@ public class HiveUtils {
 		String dbName = msTbl.getDbName();
 
 		String retVal = null;
+		// The code to reuse msTbl as Hive's metadata table is picked from:
+		// https://github.com/apache/hive/blob/branch-3.1/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java#L1126
 
-		Hive db = Hive.get();
-		org.apache.hadoop.hive.ql.metadata.Table tbl = db.getTable(dbName, tableName);
+		// For non-views, we need to do some extra fixes
+		if (!TableType.VIRTUAL_VIEW.toString().equals(msTbl.getTableType())) {
+			// Fix the non-printable chars
+			Map<String, String> parameters = msTbl.getSd().getParameters();
+			String sf = parameters!=null?parameters.get(SERIALIZATION_FORMAT) : null;
+			if (sf != null) {
+				char[] b = sf.toCharArray();
+				if ((b.length == 1) && (b[0] < 10)) { // ^A, ^B, ^C, ^D, \t
+					parameters.put(SERIALIZATION_FORMAT, Integer.toString(b[0]));
+				}
+			}
+
+			// Use LazySimpleSerDe for MetadataTypedColumnsetSerDe.
+			// NOTE: LazySimpleSerDe does not support tables with a single column of
+			// col
+			// of type "array<string>". This happens when the table is created using
+			// an
+			// earlier version of Hive.
+			if (org.apache.hadoop.hive.serde2.MetadataTypedColumnsetSerDe.class
+							.getName().equals(
+											msTbl.getSd().getSerdeInfo().getSerializationLib())
+							&& msTbl.getSd().getColsSize() > 0
+							&& msTbl.getSd().getCols().get(0).getType().indexOf('<') == -1) {
+				msTbl.getSd().getSerdeInfo().setSerializationLib(
+								org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe.class.getName());
+			}
+		}
+
+		org.apache.hadoop.hive.ql.metadata.Table tbl = new Table(msTbl);
 		List<String> duplicateProps = new ArrayList<String>();
 		try {
 			createTab_str.append("CREATE <" + TEMPORARY + "><" + EXTERNAL + ">TABLE `");
