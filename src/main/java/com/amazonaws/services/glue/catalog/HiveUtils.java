@@ -1,7 +1,6 @@
 package com.amazonaws.services.glue.catalog;
 
 import static org.apache.hadoop.hive.metastore.api.hive_metastoreConstants.META_TABLE_STORAGE;
-import static org.apache.hadoop.hive.ql.exec.DDLTask.appendSerdeParams;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -251,6 +250,19 @@ public class HiveUtils {
 		}
 
 		return retVal;
+	}
+
+	public static StringBuilder appendSerdeParams(
+					StringBuilder builder, Map<String, String> serdeParam) {
+		serdeParam = new TreeMap<String, String>(serdeParam);
+		builder.append("WITH SERDEPROPERTIES ( \n");
+		List<String> serdeCols = new ArrayList<String>();
+		for (Map.Entry<String, String> entry : serdeParam.entrySet()) {
+			serdeCols.add("  '" + entry.getKey() + "'='"
+							+ HiveStringUtils.escapeHiveCommand(entry.getValue()) + "'");
+		}
+		builder.append(StringUtils.join(serdeCols, ", \n")).append(')');
+		return builder;
 	}
 
 }
