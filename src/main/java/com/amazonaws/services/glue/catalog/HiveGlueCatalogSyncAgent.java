@@ -269,12 +269,13 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 			FieldSchema p = table.getPartitionKeys().get(i);
 
 			String specAppend;
-			if (p.getType().equals("string")) {
-				// add quotes to appended value
-				specAppend = "'" + partition.getValues().get(i) + "'";
-			} else {
-				// don't quote the appended value
-				specAppend = partition.getValues().get(i);
+			switch (p.getType()) {
+				case "string":
+				case "date":
+					specAppend = "'" + partition.getValues().get(i) + "'";
+					break;
+				default:
+					specAppend = partition.getValues().get(i);
 			}
 
 			partitionSpec += p.getName() + "=" + specAppend + ",";
