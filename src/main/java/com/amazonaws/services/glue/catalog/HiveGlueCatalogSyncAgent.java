@@ -165,7 +165,8 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 									}
 								} else {
 									LOG.info("Unable to complete query: " + query);
-									LOG.info("ERROR: " + e.getMessage());
+									cwlr.sendToCWL("ERROR: " + e.getMessage());
+									completed = true;
 								}
 							}
 						}
