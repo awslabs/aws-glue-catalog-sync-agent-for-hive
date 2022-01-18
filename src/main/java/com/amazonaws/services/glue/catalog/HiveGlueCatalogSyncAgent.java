@@ -6,6 +6,8 @@ import java.sql.SQLException;
 import java.sql.SQLRecoverableException;
 import java.sql.SQLTimeoutException;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.regex.Matcher;
@@ -48,6 +50,13 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	private int noEventSleepDuration;
 	private int reconnectSleepDuration;
 	private boolean suppressAllDropEvents = false;
+
+	private final List<String> quotedTypes = new ArrayList<String>() {
+		{
+			add("string");
+			add("date");
+		}
+	};
 
 	/**
 	 * Private class to cleanup the sync agent - to be used in a Runtime shutdown
@@ -185,6 +194,11 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		}
 	}
 
+	/** Dummy constructor for unit tests */
+	public HiveGlueCatalogSyncAgent() throws Exception {
+		super(null);
+	}
+
 	public HiveGlueCatalogSyncAgent(final Configuration conf) throws Exception {
 		super(conf);
 		this.config = conf;
@@ -261,14 +275,15 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	 * function to extract and return the partition specification for a given spec,
 	 * in format of (name=value, name=value)
 	 */
-	private String getPartitionSpec(Table table, Partition partition) {
+	protected String getPartitionSpec(Table table, Partition partition) {
 		String partitionSpec = "";
 
 		for (int i = 0; i < table.getPartitionKeysSize(); ++i) {
 			FieldSchema p = table.getPartitionKeys().get(i);
 
 			String specAppend;
-			if (p.getType().equals("string")) {
+
+			if (quotedTypes.contains(p.getType().toLowerCase())) {
 				// add quotes to appended value
 				specAppend = "'" + partition.getValues().get(i) + "'";
 			} else {
