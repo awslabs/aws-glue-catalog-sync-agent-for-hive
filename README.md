@@ -25,18 +25,19 @@ Today the Catalog Sync Agent supports the following MetaStore events:
 
 ## Installation
 
-You can build the software yourself by configuring Maven and issuing `mvn package`, which will result in the binary being built to `aws-glue-catalog-sync-agent/target/HiveGlueCatalogSyncAgent-1.3.1-SNAPSHOT.jar`, or alternatively you can download the jar from [s3://awslabs-code-us-east-1/HiveGlueCatalogSyncAgent/HiveGlueCatalogSyncAgent-1.3.1-SNAPSHOT.jar](https://s3.amazonaws.com/awslabs-code-us-east-1/HiveGlueCatalogSyncAgent/HiveGlueCatalogSyncAgent-1.3.1-SNAPSHOT.jar). You can also run `mvn assembly:assembly`, which generates a mega jar including dependencies `aws-glue-catalog-sync-agent/target/HiveGlueCatalogSyncAgent-1.3.1-SNAPSHOT-complete.jar` also found [here](https://s3.amazonaws.com/awslabs-code-us-east-1/HiveGlueCatalogSyncAgent/HiveGlueCatalogSyncAgent-1.3.1-SNAPSHOT-complete.jar).
+You can build the software yourself by configuring Maven and issuing `mvn package`, which will result in the binary being built to `aws-glue-catalog-sync-agent/target/HiveGlueCatalogSyncAgent-1.3.2-SNAPSHOT.jar`, or alternatively you can download the jar from [s3://awslabs-code-us-east-1/HiveGlueCatalogSyncAgent/HiveGlueCatalogSyncAgent-1.3.2-SNAPSHOT.jar](https://s3.amazonaws.com/awslabs-code-us-east-1/HiveGlueCatalogSyncAgent/HiveGlueCatalogSyncAgent-1.3.2-SNAPSHOT.jar). You can also run `mvn assembly:assembly`, which generates a mega jar including dependencies `aws-glue-catalog-sync-agent/target/HiveGlueCatalogSyncAgent-1.3.2-SNAPSHOT-complete.jar` also found [here](https://s3.amazonaws.com/awslabs-code-us-east-1/HiveGlueCatalogSyncAgent/HiveGlueCatalogSyncAgent-1.3.2-SNAPSHOT-complete.jar).
 
 ## Required Dependencies
 
-If you install the `HiveGlueCatalogSyncAgent-1.2-SNAPSHOT.jar` into your cluster, you must also ensure you have the following dependencies available:
+If you install the base `HiveGlueCatalogSyncAgent-1.3.2-SNAPSHOT.jar` jar into your cluster, you must also ensure you have the following dependencies available:
 
-* Log4J (2.14.1)
-* SLF4J (2.14.1)
-* AWS Java SDK Core (1.12.43)
+* SLF4J (1.7.36+)
+* Logback (1.2.3+)
+* AWS Java SDK Core, Cloudwatch Logs (1.12.177+)
 * org.antlr.stringtemplate (4.0.2)
-* Athena JDBC Driver version 2.0.6
-* AWS Java SDK CloudWatch Logs (1.12.43)
+* Hive Metastore (3.1.2)
+* Hive Common (3.1.2)
+* Hive Exec (3.1.2)
 
 ## Configuration Instructions
 # S3 
