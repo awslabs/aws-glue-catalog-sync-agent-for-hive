@@ -49,6 +49,11 @@ public class HiveUtils {
 		return prop_string;
 	}
 
+	public static final String translateLocationToS3Path(final String location) {
+		// Replace s3a/s3n with s3
+		return location.replaceFirst("s3[a,n]://", "s3://");
+	}
+
 	// Copied from Hive's code, it's a private function so had to copy it instead of
 	// reusing.
 	// License: Apache-2.0
@@ -222,8 +227,7 @@ public class HiveUtils {
 
 			String tbl_location = "  '" + HiveStringUtils.escapeHiveCommand(sd.getLocation()) + "'";
 
-			// Replace s3a/s3n with s3
-			tbl_location = tbl_location.replaceFirst("s3[a,n]://", "s3://");
+			tbl_location = translateLocationToS3Path(tbl_location);
 
 			// Table properties
 			duplicateProps.addAll(Arrays.asList(StatsSetupConst.TABLE_PARAMS_STATS_KEYS));

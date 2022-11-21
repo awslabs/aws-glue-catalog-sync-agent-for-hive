@@ -1,5 +1,6 @@
 package com.amazonaws.services.glue.catalog;
 
+import static com.amazonaws.services.glue.catalog.HiveUtils.translateLocationToS3Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
@@ -367,7 +368,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 						if (p.getSd().getLocation().startsWith("s3")) {
 							String addPartitionDDL = String.format(
 									"alter table %s add if not exists partition(%s) location '%s'", fqtn, partitionSpec,
-									p.getSd().getLocation());
+									translateLocationToS3Path(p.getSd().getLocation()));
 							if (!addToAthenaQueue(addPartitionDDL)) {
 								LOG.error("Failed to add the AddPartition event to the processing queue");
 							}
