@@ -153,11 +153,9 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 										cwlr.sendToCWL("Creating table " + tableName + " after dropping ");
 										athenaStmt.execute(query);
 										athenaStmt.close();
-										completed = true;
 									} catch (Exception e2) {
 										cwlr.sendToCWL("Unable to drop and recreate  " + tableName);
 										cwlr.sendToCWL("ERROR: " + e.getMessage());
-
 									}
 								} else if (e.getMessage().contains("Database does not exist:") && createMissingDB) {
 									try {
@@ -168,7 +166,6 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 										cwlr.sendToCWL("Retrying table creation:" + query);
 										athenaStmt.execute(query);
 										athenaStmt.close();
-										completed = true;
 									} catch (Throwable e2) {
 										LOG.info("ERROR: " + e.getMessage());
 										LOG.info("DB doesn't exist for: " + query);
@@ -176,8 +173,8 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 								} else {
 									LOG.info("Unable to complete query: " + query);
 									cwlr.sendToCWL("ERROR: " + e.getMessage());
-									completed = true;
 								}
+								completed = true;
 							}
 						}
 					}
