@@ -4,9 +4,12 @@ import static org.apache.hadoop.hive.metastore.api.hive_metastoreConstants.META_
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import static java.util.stream.Collectors.toList;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.hive.common.StatsSetupConst;
@@ -17,6 +20,7 @@ import org.apache.hadoop.hive.metastore.api.Order;
 import org.apache.hadoop.hive.metastore.api.SerDeInfo;
 import org.apache.hadoop.hive.metastore.api.SkewedInfo;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
+import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.ql.metadata.Hive;
 import org.apache.hadoop.hive.ql.metadata.HiveException;
 import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer;
@@ -269,4 +273,14 @@ public class HiveUtils {
 		return builder;
 	}
 
+  public static final Set<String> getColumnNames(final Table table) {
+    final List<String> columnNames = table.getSd()
+      .getCols()
+      .stream()
+      .map(FieldSchema::getName)
+      .collect(toList()
+    );
+
+    return new HashSet<>(columnNames);
+  }
 }
