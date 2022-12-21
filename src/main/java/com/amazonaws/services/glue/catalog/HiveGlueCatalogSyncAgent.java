@@ -1,5 +1,6 @@
 package com.amazonaws.services.glue.catalog;
 
+import static com.amazonaws.services.glue.catalog.HiveUtils.getColumnNames;
 import static com.amazonaws.services.glue.catalog.HiveUtils.translateLocationToS3Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -8,11 +9,17 @@ import java.sql.SQLRecoverableException;
 import java.sql.SQLTimeoutException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
+import java.util.StringJoiner;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.toMap;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
@@ -22,6 +29,7 @@ import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.metastore.api.Partition;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.events.AddPartitionEvent;
+import org.apache.hadoop.hive.metastore.events.AlterTableEvent;
 import org.apache.hadoop.hive.metastore.events.CreateTableEvent;
 import org.apache.hadoop.hive.metastore.events.DropPartitionEvent;
 import org.apache.hadoop.hive.metastore.events.DropTableEvent;
@@ -153,11 +161,9 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 										cwlr.sendToCWL("Creating table " + tableName + " after dropping ");
 										athenaStmt.execute(query);
 										athenaStmt.close();
-										completed = true;
 									} catch (Exception e2) {
 										cwlr.sendToCWL("Unable to drop and recreate  " + tableName);
 										cwlr.sendToCWL("ERROR: " + e.getMessage());
-
 									}
 								} else if (e.getMessage().contains("Database does not exist:") && createMissingDB) {
 									try {
@@ -168,7 +174,6 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 										cwlr.sendToCWL("Retrying table creation:" + query);
 										athenaStmt.execute(query);
 										athenaStmt.close();
-										completed = true;
 									} catch (Throwable e2) {
 										LOG.info("ERROR: " + e.getMessage());
 										LOG.info("DB doesn't exist for: " + query);
@@ -176,8 +181,8 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 								} else {
 									LOG.info("Unable to complete query: " + query);
 									cwlr.sendToCWL("ERROR: " + e.getMessage());
-									completed = true;
 								}
+								completed = true;
 							}
 						}
 					}
@@ -269,7 +274,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	}
 
 	/** Return the fully qualified table name for a table */
-	private String getFqtn(Table table) {
+	private static String getFqtn(Table table) {
 		return table.getDbName() + "." + table.getTableName();
 	}
 
@@ -428,6 +433,145 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 			}
 		} else {
 			LOG.debug(String.format("Ignoring DropPartition event as %s set to True", SUPPRESS_ALL_DROP_EVENTS));
+		}
+	}
+
+	static final boolean alterTableRequiresDropTable(final Table oldTable, final Table newTable) {
+		final Set<String> oldTableColumnNames = getColumnNames(oldTable);
+		final Set<String> newTableColumnNames = getColumnNames(newTable);
+		final boolean allOldColumnsPresentInNewTable = oldTableColumnNames.stream()
+			.allMatch(newTableColumnNames::contains);
+
+		if (!allOldColumnsPresentInNewTable) {
+			// at least one old column was removed or renamed
+			return true;
+		}
+
+		final Map<String, FieldSchema> newTableColumns = newTable
+			.getSd()
+			.getCols()
+			.stream()
+			.collect(toMap(x -> x.getName(), x -> x));
+
+		final boolean allNewColumnTypesMatchOldColumnTypes = oldTable
+			.getSd()
+			.getCols()
+			.stream()
+			.allMatch((FieldSchema oldField) -> {
+				final FieldSchema newField = newTableColumns.get(oldField.getName());
+				return oldField.getType() == newField.getType();
+			});
+
+		return !allNewColumnTypesMatchOldColumnTypes;
+	}
+
+	static final String createAthenaAlterTableAddColumnsStatement(final Table oldTable, final Table newTable) {
+		final String fqtn = getFqtn(newTable);
+		final StringBuilder ddl = new StringBuilder("alter table ")
+			.append(fqtn);
+
+		final Set<FieldSchema> oldTableColumns = new HashSet<>(oldTable.getSd().getCols());
+		final List<FieldSchema> newTableColumns = newTable.getSd().getCols();
+
+		final List<FieldSchema> newColumns = newTableColumns.stream()
+			.filter(newTableColumn -> !oldTableColumns.contains(newTableColumn))
+			.collect(toList());
+
+		final StringJoiner columnJoiner = new StringJoiner(", ", " add columns (", ")");
+		for (FieldSchema fieldSchema : newColumns) {
+			columnJoiner.add(
+				String.format(
+					"%s %s",
+					fieldSchema.getName(),
+					fieldSchema.getType()
+				)
+			);
+		}
+		return ddl.append(columnJoiner.toString()).toString();
+	}
+
+	@Override
+	public void onAlterTable(AlterTableEvent tableEvent) throws MetaException {
+		final Table oldTable = tableEvent.getOldTable();
+		final Table newTable = tableEvent.getNewTable();
+
+		if (!newTable.getTableType().equals(EXTERNAL_TABLE_TYPE) || !newTable.getSd().getLocation().startsWith("s3")) {
+			LOG.debug(
+				String.format(
+					"[AlterTableEvent] Ignoring AlterTable event for Table %s as it is not stored on S3",
+					newTable.getTableName()
+				)
+			);
+			return;
+		}
+
+		if (alterTableRequiresDropTable(oldTable, newTable)) {
+			final String fqtn = getFqtn(newTable);
+			String createTableSql = "";
+			try {
+				createTableSql = HiveUtils.showCreateTable(newTable);
+			}
+			catch (Exception e) {
+				LOG.error("[AlterTableEvent] Unable to get new Create Table statement for AlterTable event:" + e.getMessage());
+				// Nothing can be done if the Create Table statement can't be generated so just short-circuit/return.
+				return;
+			}
+			if (addToAthenaQueue(createTableSql)) {
+				LOG.debug(
+					String.format(
+						"[AlterTableEvent] Requested (RE-)CREATE TABLE for table: %s",
+						newTable.getTableName()
+					)
+				);
+			} else {
+				LOG.error(
+					String.format(
+						"[AlterTableEvent] Failed to add the (RE-)CREATE TABLE to the processing queue for table: %s",
+						newTable.getTableName()
+					)
+				);
+				// No point continuing with MSCK REPAIR if CREATE TABLE statement can't be queued so just short-circuit/return.
+				return;
+			}
+
+			final String msckRepairTableDdl = String.format(
+				"MSCK REPAIR TABLE %s",
+				fqtn
+			);
+
+			if (addToAthenaQueue(msckRepairTableDdl)) {
+				LOG.debug(
+					String.format(
+						"[AlterTableEvent] Requested MSCK REPAIR TABLE for table: %s",
+						newTable.getTableName()
+					)
+				);
+			} else {
+				LOG.error(
+					String.format(
+						"[AlterTableEvent] Failed to add the MSCK REPAIR TABLE to the processing queue for table: %s",
+						newTable.getTableName()
+					)
+				);
+			}
+		}
+		else {
+			final String alterTableAddColumnsDdl = createAthenaAlterTableAddColumnsStatement(oldTable, newTable);
+			if (addToAthenaQueue(alterTableAddColumnsDdl)) {
+				LOG.debug(
+					String.format(
+						"[AlterTableEvent] Requested ALTER TABLE ADD COLUMNS for table: %s",
+						newTable.getTableName()
+					)
+				);
+			} else {
+				LOG.error(
+					String.format(
+						"[AlterTableEvent] Failed to add the ALTER TABLE ADD COLUMNS to the processing queue for table: %s",
+						newTable.getTableName()
+					)
+				);
+			}
 		}
 	}
 }
