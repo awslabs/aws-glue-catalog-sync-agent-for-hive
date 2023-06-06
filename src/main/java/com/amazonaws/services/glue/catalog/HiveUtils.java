@@ -4,9 +4,12 @@ import static org.apache.hadoop.hive.metastore.api.hive_metastoreConstants.META_
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import static java.util.stream.Collectors.toList;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.hive.common.StatsSetupConst;
@@ -17,6 +20,7 @@ import org.apache.hadoop.hive.metastore.api.Order;
 import org.apache.hadoop.hive.metastore.api.SerDeInfo;
 import org.apache.hadoop.hive.metastore.api.SkewedInfo;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
+import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.ql.metadata.Hive;
 import org.apache.hadoop.hive.ql.metadata.HiveException;
 import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer;
@@ -47,6 +51,11 @@ public class HiveUtils {
 			prop_string += StringUtils.join(realProps, ", \n");
 		}
 		return prop_string;
+	}
+
+	public static final String translateLocationToS3Path(final String location) {
+		// Replace s3a/s3n with s3
+		return location.replaceFirst("s3[a,n]://", "s3://");
 	}
 
 	// Copied from Hive's code, it's a private function so had to copy it instead of
@@ -222,8 +231,7 @@ public class HiveUtils {
 
 			String tbl_location = "  '" + HiveStringUtils.escapeHiveCommand(sd.getLocation()) + "'";
 
-			// Replace s3a/s3n with s3
-			tbl_location = tbl_location.replaceFirst("s3[a,n]://", "s3://");
+			tbl_location = translateLocationToS3Path(tbl_location);
 
 			// Table properties
 			duplicateProps.addAll(Arrays.asList(StatsSetupConst.TABLE_PARAMS_STATS_KEYS));
@@ -265,4 +273,14 @@ public class HiveUtils {
 		return builder;
 	}
 
+  public static final Set<String> getColumnNames(final Table table) {
+    final List<String> columnNames = table.getSd()
+      .getCols()
+      .stream()
+      .map(FieldSchema::getName)
+      .collect(toList()
+    );
+
+    return new HashSet<>(columnNames);
+  }
 }

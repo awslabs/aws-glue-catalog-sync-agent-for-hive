@@ -3,5 +3,6 @@
 .project
 .classpath
 .DS_Store
+nb-configuration.xml
 src/main/.DS_Store
 src/main/.DS_Store
