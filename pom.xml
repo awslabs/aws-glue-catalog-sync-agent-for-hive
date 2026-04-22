@@ -91,9 +91,16 @@
 			<scope>provided</scope>
 		</dependency>
 		<dependency>
-			<groupId>org.antlr</groupId>
-			<artifactId>stringtemplate</artifactId>
-			<version>4.0.2</version>
+			<groupId>com.amazonaws</groupId>
+			<artifactId>aws-java-sdk-glue</artifactId>
+			<version>${aws-java-sdk-version}</version>
+			<scope>provided</scope>
+		</dependency>
+		<dependency>
+			<groupId>com.amazonaws</groupId>
+			<artifactId>aws-java-sdk-cloudwatch</artifactId>
+			<version>${aws-java-sdk-version}</version>
+			<scope>provided</scope>
 		</dependency>
 		<dependency>
 			<groupId>junit</groupId>
@@ -101,8 +108,212 @@
 			<version>4.13.1</version>
 			<scope>test</scope>
 		</dependency>
+		<dependency>
+			<groupId>org.junit.vintage</groupId>
+			<artifactId>junit-vintage-engine</artifactId>
+			<version>5.9.3</version>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>net.jqwik</groupId>
+			<artifactId>jqwik</artifactId>
+			<version>1.7.4</version>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.mockito</groupId>
+			<artifactId>mockito-core</artifactId>
+			<version>4.11.0</version>
+			<scope>test</scope>
+		</dependency>
 	</dependencies>
 	<properties>
 		<aws-java-sdk-version>1.12.177</aws-java-sdk-version>
 	</properties>
+
+	<profiles>
+		<!--
+		  Integration test profile: provisions an EMR cluster with standalone HMS,
+		  runs catalog operations via Spark, validates sync to GDC via Athena.
+
+		  Usage:
+		    mvn verify -Pintegration-test \
+		      -Dtest.s3.bucket=my-bucket \
+		      -Dtest.subnet.id=subnet-abc123 \
+		      -Dtest.aws.region=us-east-1
+
+		  Required environment/properties:
+		    test.s3.bucket    - S3 bucket for test artifacts, data, and logs
+		    test.subnet.id    - VPC subnet for the EMR cluster
+		  Optional:
+		    test.aws.region   - AWS region (default: us-east-1)
+		    test.emr.release  - EMR release label (default: emr-7.1.0)
+		    test.catalog.id   - Glue Catalog ID (default: account default)
+		-->
+		<profile>
+			<id>integration-test</id>
+			<properties>
+				<test.aws.region>us-east-1</test.aws.region>
+				<test.emr.release>emr-7.1.0</test.emr.release>
+				<test.catalog.id></test.catalog.id>
+			</properties>
+			<build>
+				<plugins>
+					<!-- Skip unit tests during integration-test to speed things up -->
+					<plugin>
+						<groupId>org.apache.maven.plugins</groupId>
+						<artifactId>maven-surefire-plugin</artifactId>
+						<version>3.1.2</version>
+						<configuration>
+							<skipTests>true</skipTests>
+						</configuration>
+					</plugin>
+
+					<!-- Build the fat JAR (assembly) before integration-test phase -->
+					<plugin>
+						<artifactId>maven-assembly-plugin</artifactId>
+						<version>2.1</version>
+						<executions>
+							<execution>
+								<id>build-fat-jar</id>
+								<phase>package</phase>
+								<goals>
+									<goal>assembly</goal>
+								</goals>
+								<configuration>
+									<finalName>HiveGlueCatalogSyncAgent-${project.version}</finalName>
+									<descriptors>
+										<descriptor>assembly.xml</descriptor>
+									</descriptors>
+								</configuration>
+							</execution>
+						</executions>
+					</plugin>
+
+					<!-- Run the integration test orchestrator script -->
+					<plugin>
+						<groupId>org.codehaus.mojo</groupId>
+						<artifactId>exec-maven-plugin</artifactId>
+						<version>3.1.0</version>
+						<executions>
+							<execution>
+								<id>run-integration-tests</id>
+								<phase>integration-test</phase>
+								<goals>
+									<goal>exec</goal>
+								</goals>
+								<configuration>
+									<executable>bash</executable>
+									<workingDirectory>${project.basedir}/integration-tests</workingDirectory>
+									<arguments>
+										<argument>run-integ-tests.sh</argument>
+									</arguments>
+									<environmentVariables>
+										<TEST_S3_BUCKET>${test.s3.bucket}</TEST_S3_BUCKET>
+										<SUBNET_ID>${test.subnet.id}</SUBNET_ID>
+										<AWS_REGION>${test.aws.region}</AWS_REGION>
+										<EMR_RELEASE>${test.emr.release}</EMR_RELEASE>
+										<GLUE_CATALOG_ID>${test.catalog.id}</GLUE_CATALOG_ID>
+									</environmentVariables>
+								</configuration>
+							</execution>
+						</executions>
+					</plugin>
+				</plugins>
+			</build>
+		</profile>
+		<!--
+		  Load test profile: provisions an EMR cluster, generates DDL for the
+		  selected scenario, submits to EMR, validates sync completeness and
+		  performance via CloudWatch Metrics.
+
+		  Usage:
+		    mvn verify -Pload-test \
+		      -Dtest.s3.bucket=my-bucket \
+		      -Dtest.subnet.id=subnet-abc123 \
+		      -Dtest.aws.region=us-east-1 \
+		      -Dtest.scenario=burst-create \
+		      -Dtest.batch.window.seconds=10
+
+		  Required environment/properties:
+		    test.s3.bucket              - S3 bucket for test artifacts, data, and logs
+		    test.subnet.id              - VPC subnet for the EMR cluster
+		  Optional:
+		    test.aws.region             - AWS region (default: us-east-1)
+		    test.scenario               - Load test scenario (default: burst-create)
+		    test.batch.window.seconds   - Batch window in seconds (default: 10)
+		-->
+		<profile>
+			<id>load-test</id>
+			<properties>
+				<test.aws.region>us-east-1</test.aws.region>
+				<test.scenario>burst-create</test.scenario>
+				<test.batch.window.seconds>10</test.batch.window.seconds>
+			</properties>
+			<build>
+				<plugins>
+					<!-- Skip unit tests during load-test to speed things up -->
+					<plugin>
+						<groupId>org.apache.maven.plugins</groupId>
+						<artifactId>maven-surefire-plugin</artifactId>
+						<version>3.1.2</version>
+						<configuration>
+							<skipTests>true</skipTests>
+						</configuration>
+					</plugin>
+
+					<!-- Build the fat JAR (assembly) before integration-test phase -->
+					<plugin>
+						<artifactId>maven-assembly-plugin</artifactId>
+						<version>2.1</version>
+						<executions>
+							<execution>
+								<id>build-fat-jar</id>
+								<phase>package</phase>
+								<goals>
+									<goal>assembly</goal>
+								</goals>
+								<configuration>
+									<finalName>HiveGlueCatalogSyncAgent-${project.version}</finalName>
+									<descriptors>
+										<descriptor>assembly.xml</descriptor>
+									</descriptors>
+								</configuration>
+							</execution>
+						</executions>
+					</plugin>
+
+					<!-- Run the load test orchestrator script -->
+					<plugin>
+						<groupId>org.codehaus.mojo</groupId>
+						<artifactId>exec-maven-plugin</artifactId>
+						<version>3.1.0</version>
+						<executions>
+							<execution>
+								<id>run-load-tests</id>
+								<phase>integration-test</phase>
+								<goals>
+									<goal>exec</goal>
+								</goals>
+								<configuration>
+									<executable>bash</executable>
+									<workingDirectory>${project.basedir}/integration-tests/load-test</workingDirectory>
+									<arguments>
+										<argument>run-load-test.sh</argument>
+									</arguments>
+									<environmentVariables>
+										<TEST_S3_BUCKET>${test.s3.bucket}</TEST_S3_BUCKET>
+										<SUBNET_ID>${test.subnet.id}</SUBNET_ID>
+										<AWS_REGION>${test.aws.region}</AWS_REGION>
+										<SCENARIO>${test.scenario}</SCENARIO>
+										<BATCH_WINDOW_SECONDS>${test.batch.window.seconds}</BATCH_WINDOW_SECONDS>
+									</environmentVariables>
+								</configuration>
+							</execution>
+						</executions>
+					</plugin>
+				</plugins>
+			</build>
+		</profile>
+	</profiles>
 </project>

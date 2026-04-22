@@ -1,27 +1,27 @@
 package com.amazonaws.services.glue.catalog;
 
-import static com.amazonaws.services.glue.catalog.HiveUtils.getColumnNames;
-import static com.amazonaws.services.glue.catalog.HiveUtils.translateLocationToS3Path;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.SQLException;
-import java.sql.SQLRecoverableException;
-import java.sql.SQLTimeoutException;
-import java.sql.Statement;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 import java.util.Set;
-import java.util.StringJoiner;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import static java.util.stream.Collectors.toList;
-import static java.util.stream.Collectors.toMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
 
-import org.apache.commons.lang3.StringUtils;
+import com.amazonaws.AmazonServiceException;
+import com.amazonaws.services.glue.AWSGlue;
+import com.amazonaws.services.glue.model.AlreadyExistsException;
+import com.amazonaws.services.glue.model.BatchCreatePartitionRequest;
+import com.amazonaws.services.glue.model.BatchDeletePartitionRequest;
+import com.amazonaws.services.glue.model.CreateDatabaseRequest;
+import com.amazonaws.services.glue.model.CreateTableRequest;
+import com.amazonaws.services.glue.model.DatabaseInput;
+import com.amazonaws.services.glue.model.DeleteTableRequest;
+import com.amazonaws.services.glue.model.EntityNotFoundException;
+import com.amazonaws.services.glue.model.PartitionInput;
+import com.amazonaws.services.glue.model.PartitionValueList;
+import com.amazonaws.services.glue.model.TableInput;
+import com.amazonaws.services.glue.model.UpdateTableRequest;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.metastore.MetaStoreEventListener;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
@@ -40,163 +40,414 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	private static final Logger LOG = LoggerFactory.getLogger(HiveGlueCatalogSyncAgent.class);
 	private static final String GLUE_CATALOG_DROP_TABLE_IF_EXISTS = "glue.catalog.dropTableIfExists";
 	private static final String GLUE_CATALOG_CREATE_MISSING_DB = "glue.catalog.createMissingDB";
-	private static final String GLUE_CATALOG_USER_KEY = "glue.catalog.user.key";
-	private final String ATHENA_JDBC_URL = "glue.catalog.athena.jdbc.url";
-	private static final String GLUE_CATALOG_USER_SECRET = "glue.catalog.user.secret";
-	private static final String GLUE_CATALOG_S3_STAGING_DIR = "glue.catalog.athena.s3.staging.dir";
-	private static final String SUPPRESS_ALL_DROP_EVENTS = "glue.catalog.athena.suppressAllDropEvents";
-	private static final String DEFAULT_ATHENA_CONNECTION_URL = "jdbc:awsathena://athena.us-east-1.amazonaws.com:443";
+	private static final String SUPPRESS_ALL_DROP_EVENTS = "glue.catalog.suppressAllDropEvents";
+	private static final String GLUE_CATALOG_ID = "glue.catalog.id";
+	private static final String GLUE_CATALOG_BATCH_WINDOW_SECONDS = "glue.catalog.batch.window.seconds";
+	private static final String GLUE_CATALOG_SYNC_TABLE_STATISTICS = "glue.catalog.syncTableStatistics";
+	private static final String GLUE_CATALOG_QUEUE_CAPACITY = "glue.catalog.queue.capacity";
+	private static final String GLUE_CATALOG_TABLE_SYSTEM_OWNERSHIP_PROP = "table.system.ownership";
+	private static final int DEFAULT_QUEUE_CAPACITY = 50000;
+
+	/**
+	 * Dedicated logger for rejected operations. Outputs machine-parseable TSV lines
+	 * (database, table, operation_type, timestamp_ms) that downstream jobs can consume
+	 * to manually sync objects that fell out of the queue.
+	 */
+	private static final Logger REJECTED_OPS_LOG =
+			LoggerFactory.getLogger("com.amazonaws.services.glue.catalog.RejectedOperations");
 
 	private Configuration config = null;
-	private Properties info;
-	private String athenaURL;
 	private Thread queueProcessor;
-	private Connection athenaConnection;
-	private volatile ConcurrentLinkedQueue<String> ddlQueue;
-	private final String EXTERNAL_TABLE_TYPE = "EXTERNAL_TABLE";
+	private volatile LinkedBlockingQueue<CatalogOperation> operationQueue;
 	private boolean dropTableIfExists = false;
 	private boolean createMissingDB = true;
 	private int noEventSleepDuration;
 	private int reconnectSleepDuration;
 	private boolean suppressAllDropEvents = false;
 
-	private final List<String> quotedTypes = new ArrayList<String>() {
-		{
-			add("string");
-			add("date");
-		}
-	};
+	// GDC Direct API fields
+	private AWSGlue glueClient;
+	private String catalogId;
+	private boolean syncTableStatistics = false;
+	private int batchWindowSeconds = 60;
+	private final Set<String> disallowedTables = ConcurrentHashMap.newKeySet();
+	private MetricsCollector metricsCollector;
 
 	/**
 	 * Private class to cleanup the sync agent - to be used in a Runtime shutdown
 	 * hook
 	 *
-	 * @author meyersi
 	 */
 	private final class SyncAgentShutdownRoutine implements Runnable {
-		private AthenaQueueProcessor p;
+		private GlueCatalogQueueProcessor p;
+		private MetricsCollector metricsCollector;
 
-		protected SyncAgentShutdownRoutine(AthenaQueueProcessor queueProcessor) {
-
+		protected SyncAgentShutdownRoutine(GlueCatalogQueueProcessor queueProcessor, MetricsCollector metricsCollector) {
 			this.p = queueProcessor;
+			this.metricsCollector = metricsCollector;
 		}
 
 		public void run() {
 			// stop the queue processing thread
 			p.stop();
+			// shutdown metrics collector (flushes remaining metrics)
+			metricsCollector.shutdown();
 		}
 	}
 
 	/**
-	 * Private class which processes the ddl queue and pushes the ddl through
-	 * Athena. If the Athena connection is broken, try and reconnect, and if not
-	 * then back off for a period of time and hope that the connection is fixed
+	 * Queue processor that drains CatalogOperations from the queue in batch windows
+	 * and executes them against the AWS Glue Data Catalog API directly.
 	 *
-	 * @author meyersi
+	 * Transient error retries (429, 500, 503) are handled by the SDK's built-in
+	 * retry policy configured in {@link GlueClientFactory}. This class only handles
+	 * domain-specific exception recovery (AlreadyExistsException, EntityNotFoundException).
 	 */
-	private final class AthenaQueueProcessor implements Runnable {
-		private boolean run = true;
-		private CloudWatchLogsReporter cwlr;
-		private final Pattern PATTERN = Pattern.compile("(?i)CREATE EXTERNAL TABLE (.*).");
+	final class GlueCatalogQueueProcessor implements Runnable {
+		private final AWSGlue glueClient;
+		private final CloudWatchLogsReporter cwlr;
+		private final MetricsCollector metricsCollector;
+		private final String catalogId;
+		private final boolean dropTableIfExists;
+		private final boolean createMissingDB;
+		private final int batchWindowMs;
+		private volatile boolean running = true;
 
-		public AthenaQueueProcessor(Configuration config) {
-			super();
-			this.cwlr = new CloudWatchLogsReporter(config);
+		GlueCatalogQueueProcessor(AWSGlue glueClient, CloudWatchLogsReporter cwlr,
+				MetricsCollector metricsCollector,
+				String catalogId, boolean dropTableIfExists, boolean createMissingDB,
+				int batchWindowMs) {
+			this.glueClient = glueClient;
+			this.cwlr = cwlr;
+			this.metricsCollector = metricsCollector;
+			this.catalogId = catalogId;
+			this.dropTableIfExists = dropTableIfExists;
+			this.createMissingDB = createMissingDB;
+			this.batchWindowMs = batchWindowMs;
 		}
 
-		/**
-		 * Method to send a shutdown message to the queue processor
-		 */
 		public void stop() {
-			LOG.info(String.format("Stopping %s", this.getClass().getCanonicalName()));
-			try {
-				athenaConnection.close();
-			} catch (SQLException e) {
-				LOG.error(e.getMessage());
-			}
-			this.run = false;
+			LOG.info("Stopping GlueCatalogQueueProcessor");
+			this.running = false;
 		}
 
+		@Override
 		public void run() {
-			// run forever or until stop is called, and continue running until the queue is
-			// empty when stop is called
-			while (true) {
-				if (!ddlQueue.isEmpty()) {
-					String query = ddlQueue.poll();
-
-					LOG.info("Working on " + query);
-					// Exception logic: if it's a network issue keep retrying. Anything else log to
-					// CWL and move on.
-					boolean completed = false;
-					while (!completed) {
-						try {
-							Statement athenaStmt = athenaConnection.createStatement();
-							cwlr.sendToCWL("Trying to execute: " + query);
-							athenaStmt.execute(query);
-							athenaStmt.close();
-							completed = true;
-						} catch (SQLException e) {
-							if (e instanceof SQLRecoverableException || e instanceof SQLTimeoutException) {
-								try {
-									configureAthenaConnection();
-								} catch (SQLException e1) {
-									// this will probably be because we can't open the connection
-									try {
-										Thread.sleep(reconnectSleepDuration);
-									} catch (InterruptedException e2) {
-										e2.printStackTrace();
-									}
-								}
-							} else {
-								// Athena's JDBC Driver just throws a generic SQLException
-								// Only way to identify exception type is through string parsing :O=
-								if (e.getMessage().contains("AlreadyExistsException") && dropTableIfExists) {
-									Matcher matcher = PATTERN.matcher(query);
-									matcher.find();
-									String tableName = matcher.group(1);
-									try {
-										cwlr.sendToCWL("Dropping table " + tableName);
-										Statement athenaStmt = athenaConnection.createStatement();
-										athenaStmt.execute("drop table " + tableName);
-										cwlr.sendToCWL("Creating table " + tableName + " after dropping ");
-										athenaStmt.execute(query);
-										athenaStmt.close();
-									} catch (Exception e2) {
-										cwlr.sendToCWL("Unable to drop and recreate  " + tableName);
-										cwlr.sendToCWL("ERROR: " + e.getMessage());
-									}
-								} else if (e.getMessage().contains("Database does not exist:") && createMissingDB) {
-									try {
-										String dbName = e.getMessage().split(":")[3].trim();
-										cwlr.sendToCWL("Trying to create database  " + dbName);
-										Statement athenaStmt = athenaConnection.createStatement();
-										athenaStmt.execute("Create database if not exists " + dbName);
-										cwlr.sendToCWL("Retrying table creation:" + query);
-										athenaStmt.execute(query);
-										athenaStmt.close();
-									} catch (Throwable e2) {
-										LOG.info("ERROR: " + e.getMessage());
-										LOG.info("DB doesn't exist for: " + query);
-									}
-								} else {
-									LOG.info("Unable to complete query: " + query);
-									cwlr.sendToCWL("ERROR: " + e.getMessage());
-								}
-								completed = true;
-							}
-						}
-					}
-
-				} else {
-					// put the thread to sleep for a configured duration
-					try {
-						LOG.debug(String.format("DDL Queue is empty. Sleeping for %s, queue state is %s",
-								noEventSleepDuration, ddlQueue.size()));
-						Thread.sleep(noEventSleepDuration);
-					} catch (InterruptedException e) {
-						LOG.error(e.getMessage());
+			while (running || !operationQueue.isEmpty()) {
+				try {
+					Thread.sleep(batchWindowMs);
+				} catch (InterruptedException e) {
+					LOG.debug("Batch window sleep interrupted");
+					Thread.currentThread().interrupt();
+					if (!running) {
+						break;
 					}
 				}
+
+				// Record queue depth before draining
+				int currentDepth = operationQueue.size();
+				int totalCapacity = currentDepth + operationQueue.remainingCapacity();
+				metricsCollector.recordQueueDepth(currentDepth);
+				if (currentDepth > totalCapacity * 0.8) {
+					LOG.warn("Queue depth {} exceeds 80% of capacity ({})", currentDepth, totalCapacity);
+				}
+
+				// Drain all operations from the queue
+				List<CatalogOperation> batch = new ArrayList<>();
+				CatalogOperation op;
+				while ((op = operationQueue.poll()) != null) {
+					batch.add(op);
+				}
+
+				if (!batch.isEmpty()) {
+					metricsCollector.recordBatchSize(batch.size());
+					long batchStart = System.currentTimeMillis();
+					processBatch(batch);
+					metricsCollector.recordBatchProcessingTimeMs(System.currentTimeMillis() - batchStart);
+				}
+			}
+			LOG.info("GlueCatalogQueueProcessor stopped");
+		}
+
+		private void processBatch(List<CatalogOperation> batch) {
+			// 1. Extract CREATE_DATABASE ops to execute first
+			List<CatalogOperation> dbOps = OperationBatcher.extractCreateDatabaseOps(batch);
+
+			// 2. Remove CREATE_DATABASE ops from the batch for table-level processing
+			List<CatalogOperation> tableOps = new ArrayList<>();
+			for (CatalogOperation o : batch) {
+				if (o.getType() != CatalogOperation.OperationType.CREATE_DATABASE) {
+					tableOps.add(o);
+				}
+			}
+
+			// 3. Execute CREATE_DATABASE operations first
+			for (CatalogOperation dbOp : dbOps) {
+				executeOperation(dbOp);
+			}
+
+			// 4. Group by table, preserving FIFO order
+			Map<String, List<CatalogOperation>> groups = OperationBatcher.groupByTable(tableOps);
+
+			// 5. Merge consecutive operations within each group, then execute
+			for (Map.Entry<String, List<CatalogOperation>> entry : groups.entrySet()) {
+				List<CatalogOperation> merged = OperationBatcher.mergeConsecutive(entry.getValue());
+				for (CatalogOperation mergedOp : merged) {
+					executeOperation(mergedOp);
+				}
+			}
+		}
+
+		private void executeOperation(CatalogOperation op) {
+			switch (op.getType()) {
+				case CREATE_TABLE:
+					executeCreateTable(op);
+					break;
+				case DROP_TABLE:
+					executeDropTable(op);
+					break;
+				case ADD_PARTITIONS:
+					executeAddPartitions(op);
+					break;
+				case DROP_PARTITIONS:
+					executeDropPartitions(op);
+					break;
+				case UPDATE_TABLE:
+					executeUpdateTable(op);
+					break;
+				case CREATE_DATABASE:
+					executeCreateDatabase(op);
+					break;
+				default:
+					LOG.warn("Unknown operation type: {}", op.getType());
+			}
+			// Record sync lag from enqueue to completion
+			metricsCollector.recordSyncLagMs(System.currentTimeMillis() - op.getCreatedAtMillis());
+		}
+
+		private void executeCreateTable(CatalogOperation op) {
+			TableInput tableInput = op.getPayload();
+			CreateTableRequest request = new CreateTableRequest()
+					.withDatabaseName(op.getDatabaseName())
+					.withTableInput(tableInput);
+			if (catalogId != null) {
+				request.withCatalogId(catalogId);
+			}
+
+			try {
+				glueClient.createTable(request);
+				cwlr.sendToCWL("SUCCESS: CREATE_TABLE " + op.getFullTableName());
+				LOG.info("Successfully created table {}", op.getFullTableName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (AlreadyExistsException e) {
+				if (dropTableIfExists) {
+					LOG.info("Table {} already exists, dropping and retrying", op.getFullTableName());
+					cwlr.sendToCWL("INFO: CREATE_TABLE " + op.getFullTableName()
+							+ " already exists, dropping and retrying");
+					try {
+						DeleteTableRequest deleteRequest = new DeleteTableRequest()
+								.withDatabaseName(op.getDatabaseName())
+								.withName(op.getTableName());
+						if (catalogId != null) {
+							deleteRequest.withCatalogId(catalogId);
+						}
+						glueClient.deleteTable(deleteRequest);
+						glueClient.createTable(request);
+						cwlr.sendToCWL("SUCCESS: CREATE_TABLE " + op.getFullTableName()
+								+ " (after drop+retry)");
+						LOG.info("Successfully created table {} after drop+retry", op.getFullTableName());
+						metricsCollector.recordOperationSuccess(op.getType());
+					} catch (Exception retryEx) {
+						cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
+								+ " drop+retry failed: " + retryEx.getMessage());
+						LOG.error("Failed to drop+retry create table {}: {}",
+								op.getFullTableName(), retryEx.getMessage());
+						metricsCollector.recordOperationFailure(op.getType());
+					}
+				} else {
+					addToBlacklist(op.getDatabaseName(), op.getTableName());
+					cwlr.sendToCWL("DISALLOWED: CREATE_TABLE " + op.getFullTableName()
+							+ " already exists and dropTableIfExists is disabled");
+					LOG.warn("Table {} already exists and dropTableIfExists is disabled, blacklisting",
+							op.getFullTableName());
+					metricsCollector.recordOperationFailure(op.getType());
+				}
+			} catch (EntityNotFoundException e) {
+				if (createMissingDB && e.getMessage() != null
+						&& e.getMessage().toLowerCase().contains("database")) {
+					LOG.info("Database {} not found for table {}, creating database and retrying",
+							op.getDatabaseName(), op.getFullTableName());
+					cwlr.sendToCWL("INFO: CREATE_TABLE " + op.getFullTableName()
+							+ " database not found, creating database and retrying");
+					try {
+						DatabaseInput dbInput = new DatabaseInput()
+								.withName(op.getDatabaseName());
+						CreateDatabaseRequest dbRequest = new CreateDatabaseRequest()
+								.withDatabaseInput(dbInput);
+						if (catalogId != null) {
+							dbRequest.withCatalogId(catalogId);
+						}
+						glueClient.createDatabase(dbRequest);
+						glueClient.createTable(request);
+						cwlr.sendToCWL("SUCCESS: CREATE_TABLE " + op.getFullTableName()
+								+ " (after createDatabase+retry)");
+						LOG.info("Successfully created table {} after creating database {}",
+								op.getFullTableName(), op.getDatabaseName());
+						metricsCollector.recordOperationSuccess(op.getType());
+					} catch (Exception retryEx) {
+						cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
+								+ " createDatabase+retry failed: " + retryEx.getMessage());
+						LOG.error("Failed to createDatabase+retry for table {}: {}",
+								op.getFullTableName(), retryEx.getMessage());
+						metricsCollector.recordOperationFailure(op.getType());
+					}
+				} else {
+					cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
+							+ " EntityNotFoundException: " + e.getMessage());
+					LOG.error("EntityNotFoundException creating table {}: {}",
+							op.getFullTableName(), e.getMessage());
+					metricsCollector.recordOperationFailure(op.getType());
+				}
+			} catch (AmazonServiceException e) {
+				cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
+						+ " failed: " + e.getMessage());
+				LOG.error("Failed to create table {}: {}", op.getFullTableName(), e.getMessage());
+				metricsCollector.recordOperationFailure(op.getType());
+			}
+		}
+
+		private void executeDropTable(CatalogOperation op) {
+			DeleteTableRequest request = new DeleteTableRequest()
+					.withDatabaseName(op.getDatabaseName())
+					.withName(op.getTableName());
+			if (catalogId != null) {
+				request.withCatalogId(catalogId);
+			}
+
+			try {
+				glueClient.deleteTable(request);
+				cwlr.sendToCWL("SUCCESS: DROP_TABLE " + op.getFullTableName());
+				LOG.info("Successfully dropped table {}", op.getFullTableName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (EntityNotFoundException e) {
+				cwlr.sendToCWL("INFO: DROP_TABLE " + op.getFullTableName()
+						+ " not found in GDC, skipping");
+				LOG.warn("Table {} not found in GDC during drop, skipping", op.getFullTableName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (AmazonServiceException e) {
+				cwlr.sendToCWL("ERROR: DROP_TABLE " + op.getFullTableName()
+						+ " failed: " + e.getMessage());
+				LOG.error("Failed to drop table {}: {}", op.getFullTableName(), e.getMessage());
+				metricsCollector.recordOperationFailure(op.getType());
+			}
+		}
+
+		@SuppressWarnings("unchecked")
+		private void executeAddPartitions(CatalogOperation op) {
+			List<PartitionInput> partitions = op.getPayload();
+			BatchCreatePartitionRequest request = new BatchCreatePartitionRequest()
+					.withDatabaseName(op.getDatabaseName())
+					.withTableName(op.getTableName())
+					.withPartitionInputList(partitions);
+			if (catalogId != null) {
+				request.withCatalogId(catalogId);
+			}
+
+			try {
+				glueClient.batchCreatePartition(request);
+				cwlr.sendToCWL("SUCCESS: ADD_PARTITIONS " + op.getFullTableName()
+						+ " (" + partitions.size() + " partitions)");
+				LOG.info("Successfully added {} partitions to {}", partitions.size(), op.getFullTableName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (EntityNotFoundException e) {
+				cwlr.sendToCWL("INFO: ADD_PARTITIONS " + op.getFullTableName()
+						+ " table not found in GDC, skipping");
+				LOG.warn("Table {} not found in GDC during addPartitions, skipping", op.getFullTableName());
+				metricsCollector.recordOperationFailure(op.getType());
+			} catch (AmazonServiceException e) {
+				cwlr.sendToCWL("ERROR: ADD_PARTITIONS " + op.getFullTableName()
+						+ " failed: " + e.getMessage());
+				LOG.error("Failed to add partitions to {}: {}", op.getFullTableName(), e.getMessage());
+				metricsCollector.recordOperationFailure(op.getType());
+			}
+		}
+
+		@SuppressWarnings("unchecked")
+		private void executeDropPartitions(CatalogOperation op) {
+			List<PartitionValueList> partitionValues = op.getPayload();
+			BatchDeletePartitionRequest request = new BatchDeletePartitionRequest()
+					.withDatabaseName(op.getDatabaseName())
+					.withTableName(op.getTableName())
+					.withPartitionsToDelete(partitionValues);
+			if (catalogId != null) {
+				request.withCatalogId(catalogId);
+			}
+
+			try {
+				glueClient.batchDeletePartition(request);
+				cwlr.sendToCWL("SUCCESS: DROP_PARTITIONS " + op.getFullTableName()
+						+ " (" + partitionValues.size() + " partitions)");
+				LOG.info("Successfully dropped {} partitions from {}", partitionValues.size(),
+						op.getFullTableName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (EntityNotFoundException e) {
+				cwlr.sendToCWL("INFO: DROP_PARTITIONS " + op.getFullTableName()
+						+ " table not found in GDC, skipping");
+				LOG.warn("Table {} not found in GDC during dropPartitions, skipping", op.getFullTableName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (AmazonServiceException e) {
+				cwlr.sendToCWL("ERROR: DROP_PARTITIONS " + op.getFullTableName()
+						+ " failed: " + e.getMessage());
+				LOG.error("Failed to drop partitions from {}: {}", op.getFullTableName(), e.getMessage());
+				metricsCollector.recordOperationFailure(op.getType());
+			}
+		}
+
+		private void executeUpdateTable(CatalogOperation op) {
+			TableInput tableInput = op.getPayload();
+			UpdateTableRequest request = new UpdateTableRequest()
+					.withDatabaseName(op.getDatabaseName())
+					.withTableInput(tableInput);
+			if (catalogId != null) {
+				request.withCatalogId(catalogId);
+			}
+
+			try {
+				glueClient.updateTable(request);
+				cwlr.sendToCWL("SUCCESS: UPDATE_TABLE " + op.getFullTableName());
+				LOG.info("Successfully updated table {}", op.getFullTableName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (AmazonServiceException e) {
+				cwlr.sendToCWL("ERROR: UPDATE_TABLE " + op.getFullTableName()
+						+ " failed: " + e.getMessage());
+				LOG.error("Failed to update table {}: {}", op.getFullTableName(), e.getMessage());
+				metricsCollector.recordOperationFailure(op.getType());
+			}
+		}
+
+		private void executeCreateDatabase(CatalogOperation op) {
+			DatabaseInput dbInput = op.getPayload();
+			CreateDatabaseRequest request = new CreateDatabaseRequest()
+					.withDatabaseInput(dbInput);
+			if (catalogId != null) {
+				request.withCatalogId(catalogId);
+			}
+
+			try {
+				glueClient.createDatabase(request);
+				cwlr.sendToCWL("SUCCESS: CREATE_DATABASE " + op.getDatabaseName());
+				LOG.info("Successfully created database {}", op.getDatabaseName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (AlreadyExistsException e) {
+				cwlr.sendToCWL("INFO: CREATE_DATABASE " + op.getDatabaseName()
+						+ " already exists, skipping");
+				LOG.info("Database {} already exists, skipping creation", op.getDatabaseName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (AmazonServiceException e) {
+				cwlr.sendToCWL("ERROR: CREATE_DATABASE " + op.getDatabaseName()
+						+ " failed: " + e.getMessage());
+				LOG.error("Failed to create database {}: {}", op.getDatabaseName(), e.getMessage());
+				metricsCollector.recordOperationFailure(op.getType());
 			}
 		}
 	}
@@ -224,53 +475,128 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 			this.reconnectSleepDuration = new Integer(noopSleepDuration).intValue();
 		}
 
-		this.info = new Properties();
-		this.info.put("log_path", "/tmp/jdbc.log");
-		this.info.put("log_level", "ERROR");
-		this.info.put("s3_staging_dir", config.get(GLUE_CATALOG_S3_STAGING_DIR));
-
 		dropTableIfExists = config.getBoolean(GLUE_CATALOG_DROP_TABLE_IF_EXISTS, false);
 		createMissingDB = config.getBoolean(GLUE_CATALOG_CREATE_MISSING_DB, true);
 		suppressAllDropEvents = config.getBoolean(SUPPRESS_ALL_DROP_EVENTS, false);
-		this.athenaURL = conf.get(ATHENA_JDBC_URL, DEFAULT_ATHENA_CONNECTION_URL);
 
-		if (config.get(GLUE_CATALOG_USER_KEY) != null) {
-			info.put("user", config.get(GLUE_CATALOG_USER_KEY));
-			info.put("password", config.get(GLUE_CATALOG_USER_SECRET));
-		} else {
-			this.info.put("aws_credentials_provider_class",
-					com.amazonaws.auth.InstanceProfileCredentialsProvider.class.getName());
-		}
+		// Read GDC Direct API config properties
+		this.catalogId = config.get(GLUE_CATALOG_ID, null);
+		this.syncTableStatistics = config.getBoolean(GLUE_CATALOG_SYNC_TABLE_STATISTICS, false);
+		this.batchWindowSeconds = config.getInt(GLUE_CATALOG_BATCH_WINDOW_SECONDS, 60);
 
-		ddlQueue = new ConcurrentLinkedQueue<>();
+		// Create Glue client (retry policy for transient errors is configured in GlueClientFactory)
+		this.glueClient = GlueClientFactory.createClient(config);
 
-		configureAthenaConnection();
+		operationQueue = new LinkedBlockingQueue<>(
+				config.getInt(GLUE_CATALOG_QUEUE_CAPACITY, DEFAULT_QUEUE_CAPACITY));
 
 		// start the queue processor thread
-		AthenaQueueProcessor athenaQueueProcessor = new AthenaQueueProcessor(this.config);
-		queueProcessor = new Thread(athenaQueueProcessor, "GlueSyncThread");
+		CloudWatchLogsReporter cwlr = new CloudWatchLogsReporter(this.config);
+		this.metricsCollector = MetricsCollectorFactory.create(config);
+		GlueCatalogQueueProcessor glueCatalogQueueProcessor = new GlueCatalogQueueProcessor(
+				this.glueClient, cwlr, metricsCollector, this.catalogId, this.dropTableIfExists, this.createMissingDB,
+				this.batchWindowSeconds * 1000);
+		queueProcessor = new Thread(glueCatalogQueueProcessor, "GlueCatalogSyncThread");
 		queueProcessor.start();
 
 		// add a shutdown hook to close the connections
 		Runtime.getRuntime()
-				.addShutdownHook(new Thread(new SyncAgentShutdownRoutine(athenaQueueProcessor), "Shutdown-thread"));
+				.addShutdownHook(new Thread(new SyncAgentShutdownRoutine(glueCatalogQueueProcessor, metricsCollector), "Shutdown-thread"));
 
-		LOG.info(String.format("%s online, connected to %s", this.getClass().getCanonicalName(), this.athenaURL));
+		LOG.info(String.format("%s online, using GDC Direct API (region: %s, catalogId: %s, queueCapacity: %d)",
+				this.getClass().getCanonicalName(),
+				config.get(GlueClientFactory.GLUE_CATALOG_REGION, GlueClientFactory.DEFAULT_REGION),
+				this.catalogId != null ? this.catalogId : "default",
+				operationQueue.remainingCapacity()));
 	}
 
-	private final void configureAthenaConnection() throws SQLException, SQLTimeoutException {
-		LOG.info(String.format("Connecting to Amazon Athena using endpoint %s", this.athenaURL));
-		athenaConnection = DriverManager.getConnection(this.athenaURL, this.info);
-	}
-
-	private boolean addToAthenaQueue(String query) {
-		try {
-			ddlQueue.add(query);
-		} catch (Exception e) {
-			LOG.error(e.getMessage());
+	/**
+	 * Checks if a table is eligible for sync to GDC.
+	 * A table is eligible if its location (after s3a/s3n translation) starts with "s3"
+	 * and it does not use a custom storage handler.
+	 */
+	boolean isSyncEligible(Table table) {
+		if (table.getSd() == null || table.getSd().getLocation() == null) {
+			return false;
+		}
+		// Check for custom storage handler — tables with storage handlers (e.g., HBase) are not supported
+		if (table.getParameters() != null && table.getParameters().containsKey("storage_handler")) {
+			LOG.debug("Table {} has a custom storage handler, skipping sync", getFqtn(table));
+			return false;
+		}
+		// Check S3 location after translation
+		String translatedLocation = TableInputBuilder.translateLocation(table.getSd().getLocation());
+		if (!translatedLocation.startsWith("s3")) {
+			LOG.debug("Table {} location is not S3-based ({}), skipping sync", getFqtn(table), translatedLocation);
 			return false;
 		}
 		return true;
+	}
+
+	/**
+	 * Checks if the table ownership allows sync.
+	 * Tables with table.system.ownership set to "gdc" are owned by GDC and should not be synced.
+	 * Tables with ownership "hms" or absent are eligible for sync.
+	 */
+	boolean isTableOwnershipValid(Table table) {
+		if (table.getParameters() == null) {
+			return true;
+		}
+		String ownership = table.getParameters().get(GLUE_CATALOG_TABLE_SYSTEM_OWNERSHIP_PROP);
+		if ("gdc".equals(ownership)) {
+			LOG.debug("Table {} is owned by GDC, skipping sync", getFqtn(table));
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Checks if a table is disallowed from sync operations.
+	 */
+	boolean isDisallowed(String dbName, String tableName) {
+		String key = dbName + "." + tableName;
+		if (disallowedTables.contains(key)) {
+			LOG.debug("Table {} is disallowed, skipping sync", key);
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Adds a table to the blacklist, preventing further sync operations.
+	 */
+	void addToBlacklist(String dbName, String tableName) {
+		String key = dbName + "." + tableName;
+		disallowedTables.add(key);
+		LOG.info("Table {} added to blacklist", key);
+	}
+
+	/**
+	 * Enqueues a CatalogOperation for processing by the queue processor.
+	 * Uses non-blocking offer() — if the bounded queue is full, the operation
+	 * is rejected and logged to the dedicated rejected-operations logger in
+	 * machine-parseable TSV format for downstream manual sync.
+	 */
+	boolean addToQueue(CatalogOperation operation) {
+		try {
+			if (operationQueue.offer(operation)) {
+				return true;
+			}
+			// Queue is full — reject with parseable output
+			metricsCollector.recordQueueRejection(operation.getType());
+			LOG.error("Queue full — rejected operation {} for {}",
+					operation.getType(), operation.getFullTableName());
+			REJECTED_OPS_LOG.error("{}\t{}\t{}\t{}",
+					operation.getDatabaseName(),
+					operation.getTableName() != null ? operation.getTableName() : "",
+					operation.getType(),
+					System.currentTimeMillis());
+			return false;
+		} catch (Exception e) {
+			LOG.error("Failed to enqueue operation {} for {}: {}",
+					operation.getType(), operation.getFullTableName(), e.getMessage());
+			return false;
+		}
 	}
 
 	/** Return the fully qualified table name for a table */
@@ -279,52 +605,37 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	}
 
 	/**
-	 * function to extract and return the partition specification for a given spec,
-	 * in format of (name=value, name=value)
-	 */
-	protected String getPartitionSpec(Table table, Partition partition) {
-		String partitionSpec = "";
-
-		for (int i = 0; i < table.getPartitionKeysSize(); ++i) {
-			FieldSchema p = table.getPartitionKeys().get(i);
-
-			String specAppend;
-
-			if (quotedTypes.contains(p.getType().toLowerCase())) {
-				// add quotes to appended value
-				specAppend = "'" + partition.getValues().get(i) + "'";
-			} else {
-				// don't quote the appended value
-				specAppend = partition.getValues().get(i);
-			}
-
-			partitionSpec += p.getName() + "=" + specAppend + ",";
-		}
-		return StringUtils.stripEnd(partitionSpec, ",");
-	}
-
-	/**
 	 * Handler for a Drop Table event
 	 */
 	public void onDropTable(DropTableEvent tableEvent) throws MetaException {
 		super.onDropTable(tableEvent);
 
-		if (!suppressAllDropEvents) {
+		if (suppressAllDropEvents) {
+			LOG.debug("Ignoring DropTable event as {} set to True", SUPPRESS_ALL_DROP_EVENTS);
+			return;
+		}
 
-			Table table = tableEvent.getTable();
-			String ddl = "";
+		Table table = tableEvent.getTable();
+		String dbName = table.getDbName();
+		String tableName = table.getTableName();
 
-			if (table.getTableType().equals(EXTERNAL_TABLE_TYPE) && table.getSd().getLocation().startsWith("s3")) {
-				ddl = String.format("drop table if exists %s", getFqtn(table));
+		if (!isSyncEligible(table)) {
+			return;
+		}
+		if (!isTableOwnershipValid(table)) {
+			return;
+		}
+		if (isDisallowed(dbName, tableName)) {
+			return;
+		}
 
-				if (!addToAthenaQueue(ddl)) {
-					LOG.error("Failed to add the DropTable event to the processing queue");
-				} else {
-					LOG.debug(String.format("Requested Drop of table: %s", table.getTableName()));
-				}
-			}
+		CatalogOperation operation = new CatalogOperation(
+				CatalogOperation.OperationType.DROP_TABLE, dbName, tableName, null);
+
+		if (!addToQueue(operation)) {
+			LOG.error("Failed to add the DropTable event to the processing queue");
 		} else {
-			LOG.debug(String.format("Ignoring DropTable event as %s set to True", SUPPRESS_ALL_DROP_EVENTS));
+			LOG.debug("Requested Drop of table: {}", tableName);
 		}
 	}
 
@@ -335,23 +646,28 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		super.onCreateTable(tableEvent);
 
 		Table table = tableEvent.getTable();
-		String ddl = "";
+		String dbName = table.getDbName();
+		String tableName = table.getTableName();
 
-		if (table.getTableType().equals(EXTERNAL_TABLE_TYPE) && table.getSd().getLocation().startsWith("s3")) {
-			try {
-				ddl = HiveUtils.showCreateTable(tableEvent.getTable());
-				LOG.info("The table: " + ddl);
-
-				if (!addToAthenaQueue(ddl)) {
-					LOG.error("Failed to add the CreateTable event to the processing queue");
-				} else {
-					LOG.debug(String.format("Requested replication of %s to AWS Glue Catalog.", table.getTableName()));
-				}
-			} catch (Exception e) {
-				LOG.error("Unable to get current Create Table statement for replication:" + e.getMessage());
-			}
+		if (!isSyncEligible(table)) {
+			return;
+		}
+		if (!isTableOwnershipValid(table)) {
+			return;
+		}
+		if (isDisallowed(dbName, tableName)) {
+			return;
 		}
 
+		TableInput tableInput = TableInputBuilder.buildTableInput(table, syncTableStatistics);
+		CatalogOperation operation = new CatalogOperation(
+				CatalogOperation.OperationType.CREATE_TABLE, dbName, tableName, tableInput);
+
+		if (!addToQueue(operation)) {
+			LOG.error("Failed to add the CreateTable event to the processing queue");
+		} else {
+			LOG.debug("Requested replication of {} to AWS Glue Catalog.", tableName);
+		}
 	}
 
 	/**
@@ -360,32 +676,42 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	public void onAddPartition(AddPartitionEvent partitionEvent) throws MetaException {
 		super.onAddPartition(partitionEvent);
 
-		if (partitionEvent.getStatus()) {
-			Table table = partitionEvent.getTable();
+		if (!partitionEvent.getStatus()) {
+			return;
+		}
 
-			if (table.getTableType().equals(EXTERNAL_TABLE_TYPE) && table.getSd().getLocation().startsWith("s3")) {
-				String fqtn = getFqtn(table);
+		Table table = partitionEvent.getTable();
+		String dbName = table.getDbName();
+		String tableName = table.getTableName();
 
-				if (fqtn != null && !fqtn.equals("")) {
-					partitionEvent.getPartitionIterator().forEachRemaining(p -> {
-						String partitionSpec = getPartitionSpec(table, p);
+		if (!isSyncEligible(table)) {
+			return;
+		}
+		if (!isTableOwnershipValid(table)) {
+			return;
+		}
+		if (isDisallowed(dbName, tableName)) {
+			return;
+		}
 
-						if (p.getSd().getLocation().startsWith("s3")) {
-							String addPartitionDDL = String.format(
-									"alter table %s add if not exists partition(%s) location '%s'", fqtn, partitionSpec,
-									translateLocationToS3Path(p.getSd().getLocation()));
-							if (!addToAthenaQueue(addPartitionDDL)) {
-								LOG.error("Failed to add the AddPartition event to the processing queue");
-							}
-						} else {
-							LOG.debug(String.format("Not adding partition (%s) as it is not S3 based (location %s)",
-									partitionSpec, p.getSd().getLocation()));
-						}
-					});
+		List<PartitionInput> partitionInputs = new ArrayList<>();
+		partitionEvent.getPartitionIterator().forEachRemaining(p -> {
+			if (p.getSd() != null && p.getSd().getLocation() != null) {
+				String translatedLocation = TableInputBuilder.translateLocation(p.getSd().getLocation());
+				if (translatedLocation.startsWith("s3")) {
+					partitionInputs.add(TableInputBuilder.buildPartitionInput(p));
+				} else {
+					LOG.debug("Not adding partition as it is not S3 based (location {})", p.getSd().getLocation());
 				}
-			} else {
-				LOG.debug(String.format("Ignoring Add Partition Event for Table %s as it is not stored on S3",
-						table.getTableName()));
+			}
+		});
+
+		if (!partitionInputs.isEmpty()) {
+			CatalogOperation operation = new CatalogOperation(
+					CatalogOperation.OperationType.ADD_PARTITIONS, dbName, tableName, partitionInputs);
+
+			if (!addToQueue(operation)) {
+				LOG.error("Failed to add the AddPartition event to the processing queue");
 			}
 		}
 	}
@@ -396,182 +722,81 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	 */
 	public void onDropPartition(DropPartitionEvent partitionEvent) throws MetaException {
 		super.onDropPartition(partitionEvent);
-		if (!suppressAllDropEvents) {
-			if (partitionEvent.getStatus()) {
-				Table table = partitionEvent.getTable();
 
-				if (table.getTableType().equals(EXTERNAL_TABLE_TYPE) && table.getSd().getLocation().startsWith("s3")) {
-					String fqtn = getFqtn(table);
+		if (suppressAllDropEvents) {
+			LOG.debug("Ignoring DropPartition event as {} set to True", SUPPRESS_ALL_DROP_EVENTS);
+			return;
+		}
 
-					if (fqtn != null && !fqtn.equals("")) {
-						partitionEvent.getPartitionIterator().forEachRemaining(p -> {
-							String partitionSpec = getPartitionSpec(table, p);
+		if (!partitionEvent.getStatus()) {
+			return;
+		}
 
-							if (p.getSd().getLocation().startsWith("s3")) {
-								String ddl = String.format("alter table %s drop if exists partition(%s);", fqtn,
-										partitionSpec);
+		Table table = partitionEvent.getTable();
+		String dbName = table.getDbName();
+		String tableName = table.getTableName();
 
-								if (!addToAthenaQueue(ddl)) {
-									LOG.error(String.format(
-											"Failed to add the DropPartition event to the processing queue for specification %s",
-											partitionSpec));
-								} else {
-									LOG.debug(String.format("Requested Drop of Partition with Specification (%s)",
-											partitionSpec));
-								}
-							} else {
-								LOG.debug(
-										String.format("Not dropping partition (%s) as it is not S3 based (location %s)",
-												partitionSpec, p.getSd().getLocation()));
-							}
-						});
-					}
+		if (!isSyncEligible(table)) {
+			return;
+		}
+		if (!isTableOwnershipValid(table)) {
+			return;
+		}
+		if (isDisallowed(dbName, tableName)) {
+			return;
+		}
+
+		List<PartitionValueList> partitionValueLists = new ArrayList<>();
+		partitionEvent.getPartitionIterator().forEachRemaining(p -> {
+			if (p.getSd() != null && p.getSd().getLocation() != null) {
+				String translatedLocation = TableInputBuilder.translateLocation(p.getSd().getLocation());
+				if (translatedLocation.startsWith("s3")) {
+					PartitionValueList pvl = new PartitionValueList()
+							.withValues(new ArrayList<>(p.getValues()));
+					partitionValueLists.add(pvl);
 				} else {
-					LOG.debug(String.format("Ignoring Drop Partition Event for Table %s as it is not stored on S3",
-							table.getTableName()));
+					LOG.debug("Not dropping partition as it is not S3 based (location {})", p.getSd().getLocation());
 				}
 			}
-		} else {
-			LOG.debug(String.format("Ignoring DropPartition event as %s set to True", SUPPRESS_ALL_DROP_EVENTS));
+		});
+
+		if (!partitionValueLists.isEmpty()) {
+			CatalogOperation operation = new CatalogOperation(
+					CatalogOperation.OperationType.DROP_PARTITIONS, dbName, tableName, partitionValueLists);
+
+			if (!addToQueue(operation)) {
+				LOG.error("Failed to add the DropPartition event to the processing queue");
+			}
 		}
-	}
-
-	static final boolean alterTableRequiresDropTable(final Table oldTable, final Table newTable) {
-		final Set<String> oldTableColumnNames = getColumnNames(oldTable);
-		final Set<String> newTableColumnNames = getColumnNames(newTable);
-		final boolean allOldColumnsPresentInNewTable = oldTableColumnNames.stream()
-			.allMatch(newTableColumnNames::contains);
-
-		if (!allOldColumnsPresentInNewTable) {
-			// at least one old column was removed or renamed
-			return true;
-		}
-
-		final Map<String, FieldSchema> newTableColumns = newTable
-			.getSd()
-			.getCols()
-			.stream()
-			.collect(toMap(x -> x.getName(), x -> x));
-
-		final boolean allNewColumnTypesMatchOldColumnTypes = oldTable
-			.getSd()
-			.getCols()
-			.stream()
-			.allMatch((FieldSchema oldField) -> {
-				final FieldSchema newField = newTableColumns.get(oldField.getName());
-				return oldField.getType() == newField.getType();
-			});
-
-		return !allNewColumnTypesMatchOldColumnTypes;
-	}
-
-	static final String createAthenaAlterTableAddColumnsStatement(final Table oldTable, final Table newTable) {
-		final String fqtn = getFqtn(newTable);
-		final StringBuilder ddl = new StringBuilder("alter table ")
-			.append(fqtn);
-
-		final Set<FieldSchema> oldTableColumns = new HashSet<>(oldTable.getSd().getCols());
-		final List<FieldSchema> newTableColumns = newTable.getSd().getCols();
-
-		final List<FieldSchema> newColumns = newTableColumns.stream()
-			.filter(newTableColumn -> !oldTableColumns.contains(newTableColumn))
-			.collect(toList());
-
-		final StringJoiner columnJoiner = new StringJoiner(", ", " add columns (", ")");
-		for (FieldSchema fieldSchema : newColumns) {
-			columnJoiner.add(
-				String.format(
-					"%s %s",
-					fieldSchema.getName(),
-					fieldSchema.getType()
-				)
-			);
-		}
-		return ddl.append(columnJoiner.toString()).toString();
 	}
 
 	@Override
 	public void onAlterTable(AlterTableEvent tableEvent) throws MetaException {
-		final Table oldTable = tableEvent.getOldTable();
-		final Table newTable = tableEvent.getNewTable();
+		super.onAlterTable(tableEvent);
 
-		if (!newTable.getTableType().equals(EXTERNAL_TABLE_TYPE) || !newTable.getSd().getLocation().startsWith("s3")) {
-			LOG.debug(
-				String.format(
-					"[AlterTableEvent] Ignoring AlterTable event for Table %s as it is not stored on S3",
-					newTable.getTableName()
-				)
-			);
+		final Table newTable = tableEvent.getNewTable();
+		String dbName = newTable.getDbName();
+		String tableName = newTable.getTableName();
+
+		if (!isSyncEligible(newTable)) {
+			LOG.debug("[AlterTableEvent] Ignoring AlterTable event for Table {} as it is not sync eligible", tableName);
+			return;
+		}
+		if (!isTableOwnershipValid(newTable)) {
+			return;
+		}
+		if (isDisallowed(dbName, tableName)) {
 			return;
 		}
 
-		if (alterTableRequiresDropTable(oldTable, newTable)) {
-			final String fqtn = getFqtn(newTable);
-			String createTableSql = "";
-			try {
-				createTableSql = HiveUtils.showCreateTable(newTable);
-			}
-			catch (Exception e) {
-				LOG.error("[AlterTableEvent] Unable to get new Create Table statement for AlterTable event:" + e.getMessage());
-				// Nothing can be done if the Create Table statement can't be generated so just short-circuit/return.
-				return;
-			}
-			if (addToAthenaQueue(createTableSql)) {
-				LOG.debug(
-					String.format(
-						"[AlterTableEvent] Requested (RE-)CREATE TABLE for table: %s",
-						newTable.getTableName()
-					)
-				);
-			} else {
-				LOG.error(
-					String.format(
-						"[AlterTableEvent] Failed to add the (RE-)CREATE TABLE to the processing queue for table: %s",
-						newTable.getTableName()
-					)
-				);
-				// No point continuing with MSCK REPAIR if CREATE TABLE statement can't be queued so just short-circuit/return.
-				return;
-			}
+		TableInput tableInput = TableInputBuilder.buildTableInput(newTable, syncTableStatistics);
+		CatalogOperation operation = new CatalogOperation(
+				CatalogOperation.OperationType.UPDATE_TABLE, dbName, tableName, tableInput);
 
-			final String msckRepairTableDdl = String.format(
-				"MSCK REPAIR TABLE %s",
-				fqtn
-			);
-
-			if (addToAthenaQueue(msckRepairTableDdl)) {
-				LOG.debug(
-					String.format(
-						"[AlterTableEvent] Requested MSCK REPAIR TABLE for table: %s",
-						newTable.getTableName()
-					)
-				);
-			} else {
-				LOG.error(
-					String.format(
-						"[AlterTableEvent] Failed to add the MSCK REPAIR TABLE to the processing queue for table: %s",
-						newTable.getTableName()
-					)
-				);
-			}
-		}
-		else {
-			final String alterTableAddColumnsDdl = createAthenaAlterTableAddColumnsStatement(oldTable, newTable);
-			if (addToAthenaQueue(alterTableAddColumnsDdl)) {
-				LOG.debug(
-					String.format(
-						"[AlterTableEvent] Requested ALTER TABLE ADD COLUMNS for table: %s",
-						newTable.getTableName()
-					)
-				);
-			} else {
-				LOG.error(
-					String.format(
-						"[AlterTableEvent] Failed to add the ALTER TABLE ADD COLUMNS to the processing queue for table: %s",
-						newTable.getTableName()
-					)
-				);
-			}
+		if (!addToQueue(operation)) {
+			LOG.error("[AlterTableEvent] Failed to add the UPDATE_TABLE to the processing queue for table: {}", tableName);
+		} else {
+			LOG.debug("[AlterTableEvent] Requested UPDATE_TABLE for table: {}", tableName);
 		}
 	}
 }

@@ -1,0 +1,259 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EMR cluster for HMS-to-GDC sync agent integration testing.
+  Creates a transient cluster with standalone HMS (not GDC), the sync agent
+  installed as a Hive MetaStoreEventListener, and auto-terminates after steps complete.
+
+Parameters:
+  S3Bucket:
+    Type: String
+    Description: S3 bucket for test data, scripts, logs, and the sync agent JAR
+
+  SyncAgentJarS3Key:
+    Type: String
+    Default: integ-test/jars/HiveGlueCatalogSyncAgent-complete.jar
+    Description: S3 key for the sync agent fat JAR
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet for EMR cluster
+
+  EmrReleaseLabel:
+    Type: String
+    Default: emr-7.1.0
+    Description: EMR release label (must support Iceberg and Hive 3.x)
+
+  InstanceType:
+    Type: String
+    Default: m5.xlarge
+
+  GlueCatalogRegion:
+    Type: String
+    Default: us-east-1
+
+  GlueCatalogId:
+    Type: String
+    Default: ''
+    Description: Optional Glue Catalog ID (leave empty for default account catalog)
+
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: Optional EC2 key pair for SSH access (leave empty to disable)
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  HasCatalogId: !Not [!Equals [!Ref GlueCatalogId, '']]
+
+Resources:
+
+  # ── IAM Roles ─────────────────────────────────────────────────────────────
+
+  EmrServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-emr-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticmapreduce.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEMRServicePolicy_v2
+      Policies:
+        - PolicyName: EmrEc2PassRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:ModifyNetworkInterfaceAttribute
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:RunInstances
+                  - ec2:TerminateInstances
+                  - ec2:CreateTags
+                  - ec2:DescribeVolumes
+                  - ec2:CreateVolume
+                  - ec2:DeleteVolume
+                  - ec2:AttachVolume
+                  - ec2:DetachVolume
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt EmrEc2Role.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ec2.amazonaws.com
+
+  EmrEc2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-emr-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role
+      Policies:
+        - PolicyName: GlueCatalogAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:CreateDatabase
+                  - glue:GetDatabase
+                  - glue:CreateTable
+                  - glue:GetTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:BatchCreatePartition
+                  - glue:BatchDeletePartition
+                  - glue:GetPartitions
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+        - PolicyName: S3TestBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3Bucket}'
+                  - !Sub 'arn:aws:s3:::${S3Bucket}/*'
+
+  EmrEc2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-emr-ec2-profile'
+      Roles:
+        - !Ref EmrEc2Role
+
+  # ── EMR Cluster ───────────────────────────────────────────────────────────
+
+  EmrCluster:
+    Type: AWS::EMR::Cluster
+    Properties:
+      Name: !Sub '${AWS::StackName}-integ-test'
+      ReleaseLabel: !Ref EmrReleaseLabel
+      Applications:
+        - Name: Spark
+        - Name: Hive
+      ServiceRole: !Ref EmrServiceRole
+      JobFlowRole: !Ref EmrEc2InstanceProfile
+      LogUri: !Sub 's3://${S3Bucket}/integ-test/emr-logs/'
+      AutoTerminationPolicy:
+        IdleTimeout: 60  # 1 minute idle timeout — cluster terminates quickly after steps
+      StepConcurrencyLevel: 1
+
+      Instances:
+        Ec2SubnetId: !Ref SubnetId
+        Ec2KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+        KeepJobFlowAliveWhenNoSteps: true  # Stays alive until idle timeout
+        MasterInstanceGroup:
+          InstanceCount: 1
+          InstanceType: !Ref InstanceType
+          Market: ON_DEMAND
+        CoreInstanceGroup:
+          InstanceCount: 1
+          InstanceType: !Ref InstanceType
+          Market: ON_DEMAND
+
+      # ── Bootstrap: install sync agent JAR into Hive auxlib ──────────────
+      BootstrapActions:
+        - Name: InstallSyncAgentJar
+          ScriptBootstrapAction:
+            Path: !Sub 's3://${S3Bucket}/integ-test/scripts/bootstrap-install-agent.sh'
+            Args:
+              - !Sub 's3://${S3Bucket}/${SyncAgentJarS3Key}'
+
+      # ── Configurations ──────────────────────────────────────────────────
+      # Key: Use local HMS (Derby), NOT Glue Data Catalog as the metastore.
+      # The sync agent is registered as a MetaStoreEventListener.
+      Configurations:
+        # Disable Glue as the Hive metastore — use local/Derby HMS
+        - Classification: hive-site
+          ConfigurationProperties:
+            # Do NOT set hive.metastore.client.factory.class to Glue
+            # This ensures HMS is standalone (Derby-backed)
+            hive.metastore.event.listeners: com.amazonaws.services.glue.catalog.HiveGlueCatalogSyncAgent
+            # Sync agent configuration
+            glue.catalog.region: !Ref GlueCatalogRegion
+            glue.catalog.createMissingDB: 'true'
+            glue.catalog.dropTableIfExists: 'true'
+            glue.catalog.suppressAllDropEvents: 'false'
+            glue.catalog.batch.window.seconds: '10'
+            glue.catalog.syncTableStatistics: 'false'
+            glue.catalog.metrics.enabled: 'true'
+
+        # Conditionally add catalog ID via a separate hive-site classification
+        # (AWS::NoValue doesn't work inside ConfigurationProperties maps)
+        - !If
+          - HasCatalogId
+          - Classification: hive-site
+            ConfigurationProperties:
+              glue.catalog.id: !Ref GlueCatalogId
+          - !Ref 'AWS::NoValue'
+
+        # Spark: use Hive metastore (not Glue catalog) + enable Iceberg
+        - Classification: spark-defaults
+          ConfigurationProperties:
+            spark.sql.catalogImplementation: hive
+            spark.sql.extensions: org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+            spark.sql.catalog.hive_prod: org.apache.iceberg.spark.SparkCatalog
+            spark.sql.catalog.hive_prod.type: hive
+
+        # Iceberg is bundled with EMR 7.x, no extra JARs needed
+        - Classification: iceberg-defaults
+          ConfigurationProperties:
+            iceberg.enabled: 'true'
+
+  # ── EMR Steps ─────────────────────────────────────────────────────────────
+  # Steps are submitted by run-tests.sh, not defined here.
+  # This keeps the template reusable and allows iterative test runs.
+
+Outputs:
+  ClusterId:
+    Description: EMR Cluster ID
+    Value: !Ref EmrCluster
+
+  ClusterDns:
+    Description: Master node DNS (retrieve via aws emr describe-cluster)
+    Value: !Sub 'Use: aws emr describe-cluster --cluster-id ${EmrCluster} --query Cluster.MasterPublicDnsName'
+
+  S3TestPath:
+    Description: S3 path for test data
+    Value: !Sub 's3://${S3Bucket}/integ-test/'
